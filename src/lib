@@ -1,0 +1,3594 @@
+// Analytics tracking and A/B testing utilities for Coach2Coach
+
+export interface AnalyticsEvent {
+  eventName: string;
+  userId?: string;
+  anonId: string;
+  sessionId: string;
+  path?: string;
+  referrer?: string;
+  userAgent?: string;
+  country?: string;
+  properties?: Record<string, any>;
+  experimentExposures?: Record<string, string>;
+}
+
+// Analytics configuration
+export const ANALYTICS_CONFIG = {
+  enabled: true,
+  respectDNT: true,
+  disableForAdmins: true,
+  vendor: 'builtin'
+};
+
+// Generate anonymous ID for tracking
+export function generateAnonId(): string {
+  const existing = localStorage.getItem('coach2coach_anon_id');
+  if (existing) return existing;
+  
+  const anonId = 'anon_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+  localStorage.setItem('coach2coach_anon_id', anonId);
+  return anonId;
+}
+
+// Generate session ID
+export function generateSessionId(): string {
+  const existing = sessionStorage.getItem('coach2coach_session_id');
+  if (existing) return existing;
+  
+  const sessionId = 'sess_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+  sessionStorage.setItem('coach2coach_session_id', sessionId);
+  return sessionId;
+}
+
+// Check if user has opted out of analytics
+export function hasOptedOut(): boolean {
+  return localStorage.getItem('coach2coach_analytics_opt_out') === 'true';
+}
+
+// Track analytics event
+export async function trackEvent(event: Omit<AnalyticsEvent, 'anonId' | 'sessionId'>): Promise<void> {
+  try {
+    // Check if analytics is disabled
+    if (!ANALYTICS_CONFIG.enabled || hasOptedOut()) {
+      return;
+    }
+
+    // Respect Do Not Track
+    if (ANALYTICS_CONFIG.respectDNT && navigator.doNotTrack === '1') {
+      return;
+    }
+
+    const fullEvent: AnalyticsEvent = {
+      ...event,
+      anonId: generateAnonId(),
+      sessionId: generateSessionId(),
+      path: event.path || window.location.pathname,
+      referrer: event.referrer || document.referrer,
+      userAgent: navigator.userAgent,
+      country: 'US'
+    };
+
+    // Send to analytics API
+    await fetch('/api/analytics/track', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(fullEvent)
+    });
+  } catch (error) {
+    console.error('Analytics tracking error:', error);
+  }
+}
+
+// Track page view
+export function trackPageView(path?: string): void {
+  trackEvent({
+    eventName: 'page_view',
+    path: path || window.location.pathname,
+    properties: {
+      title: document.title
+    }
+  });
+}
+
+// Track conversion event
+export function trackConversion(eventName: string, properties?: Record<string, any>): void {
+  trackEvent({
+    eventName,
+    properties: properties || {}
+  });
+}
+
+// A/B Testing utilities
+class ExperimentManager {
+  private assignments: Map<string, string> = new Map();
+
+  async getVariant(experimentKey: string, userId?: string): Promise<string> {
+    try {
+      // Check cache first
+      if (this.assignments.has(experimentKey)) {
+        return this.assignments.get(experimentKey)!;
+      }
+
+      // Get variant from server
+      const response = await fetch('/api/experiments/assign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          experimentKey,
+          subjectId: userId || generateAnonId()
+        })
+      });
+
+      const data = await response.json();
+      const variant = data.success ? data.variant : 'control';
+      
+      // Cache assignment
+      this.assignments.set(experimentKey, variant);
+      
+      // Track exposure
+      trackEvent({
+        eventName: 'experiment_exposure',
+        userId,
+        properties: {
+          experiment_key: experimentKey,
+          variant
+        }
+      });
+
+      return variant;
+    } catch (error) {
+      console.error('Experiment assignment error:', error);
+      return 'control';
+    }
+  }
+
+  async trackConversion(experimentKey: string, userId?: string): Promise<void> {
+    const variant = this.assignments.get(experimentKey);
+    if (variant) {
+      trackEvent({
+        eventName: 'experiment_conversion',
+        userId,
+        properties: {
+          experiment_key: experimentKey,
+          variant
+        }
+      });
+    }
+  }
+}
+
+export const experimentManager = new ExperimentManager();
+// API utilities for Coach2Coach platform with membership gating
+
+import { supabase } from './supabase';
+
+export interface ApiResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
+
+// Server-side membership verification
+export async function requireActiveMember(userId: string): Promise<boolean> {
+  try {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('membership_status, membership_current_period_end')
+      .eq('user_id', userId)
+      .single();
+
+    if (!profile) return false;
+
+    if (profile.membership_status === 'active') {
+      // Check if period hasn't ended
+      if (profile.membership_current_period_end) {
+        return new Date(profile.membership_current_period_end) > new Date();
+      }
+      return true;
+    }
+
+    return false;
+  } catch (error) {
+    console.error('Error checking membership:', error);
+    return false;
+  }
+}
+
+// Server-side creator verification
+export async function requireCreator(userId: string): Promise<boolean> {
+  try {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('membership_status, is_creator_enabled')
+      .eq('user_id', userId)
+      .single();
+
+    if (!profile) return false;
+
+    return profile.membership_status === 'active' && profile.is_creator_enabled;
+  } catch (error) {
+    console.error('Error checking creator status:', error);
+    return false;
+  }
+}
+
+// Check if user can download a specific resource
+export async function canDownloadResource(userId: string, resourceId: string): Promise<boolean> {
+  try {
+    // Check if user is active member
+    const isActive = await requireActiveMember(userId);
+    if (!isActive) return false;
+
+    // Check if user owns the resource
+    const { data: resource } = await supabase
+      .from('resources')
+      .select(`
+        owner_id,
+        profiles!inner(user_id)
+      `)
+      .eq('id', resourceId)
+      .single();
+
+    if (resource?.profiles.user_id === userId) {
+      return true; // Owner can always download
+    }
+
+    // Check if user has purchased the resource
+    const { data: purchase } = await supabase
+      .from('purchases')
+      .select('id')
+      .eq('buyer_id', userId)
+      .eq('resource_id', resourceId)
+      .eq('status', 'succeeded')
+      .single();
+
+    return !!purchase;
+  } catch (error) {
+    console.error('Error checking download permission:', error);
+    return false;
+  }
+}
+
+// Log audit event
+export async function logAuditEvent(
+  actorId: string,
+  action: string,
+  subjectType: string,
+  subjectId?: string,
+  metadata?: any
+): Promise<void> {
+  try {
+    await supabase
+      .from('audit_events')
+      .insert({
+        actor_id: actorId,
+        action,
+        subject_type: subjectType,
+        subject_id: subjectId,
+        metadata: metadata || {}
+      });
+  } catch (error) {
+    console.error('Error logging audit event:', error);
+  }
+}
+
+// API endpoint helpers
+export const api = {
+  // Create membership checkout session
+  createSubscriptionCheckout: async (userId: string): Promise<ApiResponse<{ url: string }>> => {
+    try {
+      const response = await fetch('/api/checkout/subscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId })
+      });
+
+      const data = await response.json();
+      
+      if (!response.ok) {
+        return { success: false, error: data.error };
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: 'Failed to create checkout session' };
+    }
+  },
+
+  // Create billing portal session
+  createBillingPortal: async (userId: string): Promise<ApiResponse<{ url: string }>> => {
+    try {
+      const response = await fetch('/api/membership/portal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId })
+      });
+
+      const data = await response.json();
+      
+      if (!response.ok) {
+        return { success: false, error: data.error };
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: 'Failed to create billing portal' };
+    }
+  },
+
+  // Create Stripe Connect account
+  createConnectAccount: async (userId: string): Promise<ApiResponse<{ accountId: string; onboardingUrl: string }>> => {
+    try {
+      const response = await fetch('/api/creator/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId })
+      });
+
+      const data = await response.json();
+      
+      if (!response.ok) {
+        return { success: false, error: data.error };
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: 'Failed to create Connect account' };
+    }
+  },
+
+  // Upload resource
+  uploadResource: async (resourceData: any): Promise<ApiResponse<{ resourceId: string }>> => {
+    try {
+      const response = await fetch('/api/resources', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(resourceData)
+      });
+
+      const data = await response.json();
+      
+      if (!response.ok) {
+        return { success: false, error: data.error };
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: 'Failed to upload resource' };
+    }
+  },
+
+  // Create resource purchase
+  purchaseResource: async (resourceId: string): Promise<ApiResponse<{ checkoutUrl: string }>> => {
+    try {
+      const response = await fetch('/api/purchase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resourceId })
+      });
+
+      const data = await response.json();
+      
+      if (!response.ok) {
+        return { success: false, error: data.error };
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: 'Failed to create purchase' };
+    }
+  },
+
+  // Get secure download URL
+  getDownloadUrl: async (resourceId: string): Promise<ApiResponse<{ downloadUrl: string; filename: string }>> => {
+    try {
+      const response = await fetch(`/api/download/${resourceId}`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      const data = await response.json();
+      
+      if (!response.ok) {
+        return { success: false, error: data.error };
+      }
+
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: 'Failed to get download URL' };
+    }
+  }
+};
+// Authentication and subscription utilities for Coach2Coach platform
+import { supabase } from './supabase';
+
+export interface UserSubscription {
+  id: string;
+  userId: string;
+  status: 'trial' | 'active' | 'canceled' | 'expired';
+  trialEndsAt?: string;
+  currentPeriodStart: string;
+  currentPeriodEnd: string;
+  cancelAtPeriodEnd: boolean;
+  stripeCustomerId?: string;
+  stripeSubscriptionId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Check if user has active subscription or trial
+export const hasActiveAccess = (subscription: UserSubscription | null): boolean => {
+  if (!subscription) return false;
+  
+  const now = new Date();
+  
+  // Check trial access
+  if (subscription.status === 'trial' && subscription.trialEndsAt) {
+    return new Date(subscription.trialEndsAt) > now;
+  }
+  
+  // Check paid subscription
+  if (subscription.status === 'active') {
+    return new Date(subscription.currentPeriodEnd) > now;
+  }
+  
+  return false;
+};
+
+// Check if user is in trial period
+export const isInTrial = (subscription: UserSubscription | null): boolean => {
+  if (!subscription || subscription.status !== 'trial') return false;
+  
+  if (subscription.trialEndsAt) {
+    return new Date(subscription.trialEndsAt) > new Date();
+  }
+  
+  return false;
+};
+
+// Get days remaining in trial
+export const getTrialDaysRemaining = (subscription: UserSubscription | null): number => {
+  if (!subscription || !subscription.trialEndsAt) return 0;
+  
+  const now = new Date();
+  const trialEnd = new Date(subscription.trialEndsAt);
+  const diffTime = trialEnd.getTime() - now.getTime();
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  
+  return Math.max(0, diffDays);
+};
+
+// Create trial subscription for new users
+export const createTrialSubscription = (userId: string): UserSubscription => {
+  const now = new Date();
+  const trialEnd = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1000)); // 7 days from now
+  
+  return {
+    id: `trial_${userId}_${Date.now()}`,
+    userId,
+    status: 'trial',
+    trialEndsAt: trialEnd.toISOString(),
+    currentPeriodStart: now.toISOString(),
+    currentPeriodEnd: trialEnd.toISOString(),
+    cancelAtPeriodEnd: false,
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString()
+  };
+};
+
+// Mock subscription data for demo
+export const getMockSubscription = (userId: string): UserSubscription => {
+  // Check if user already has a trial in localStorage
+  const existingTrial = localStorage.getItem(`coach2coach_subscription_${userId}`);
+  
+  if (existingTrial) {
+    return JSON.parse(existingTrial);
+  }
+  
+  // Create new trial
+  const trial = createTrialSubscription(userId);
+  localStorage.setItem(`coach2coach_subscription_${userId}`, JSON.stringify(trial));
+  
+  return trial;
+};
+
+// Update subscription status
+export const updateSubscriptionStatus = (userId: string, updates: Partial<UserSubscription>): UserSubscription => {
+  const existing = getMockSubscription(userId);
+  const updated = {
+    ...existing,
+    ...updates,
+    updatedAt: new Date().toISOString()
+  };
+  
+  localStorage.setItem(`coach2coach_subscription_${userId}`, JSON.stringify(updated));
+  return updated;
+};
+import { supabase } from './supabase';
+
+export interface UploadResult {
+  success: boolean;
+  url?: string;
+  error?: string;
+  fileName?: string;
+  filePath?: string;
+}
+
+export interface FileValidation {
+  maxSize: number; // in bytes
+  allowedTypes: string[];
+  maxFiles?: number;
+}
+
+// File validation configurations
+export const FILE_VALIDATIONS = {
+  resources: {
+    maxSize: 50 * 1024 * 1024, // 50MB
+    allowedTypes: [
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-powerpoint',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'text/plain'
+    ],
+    maxFiles: 10
+  },
+  images: {
+    maxSize: 10 * 1024 * 1024, // 10MB
+    allowedTypes: [
+      'image/jpeg',
+      'image/jpg',
+      'image/png',
+      'image/webp',
+      'image/gif'
+    ],
+    maxFiles: 5
+  },
+  avatars: {
+    maxSize: 5 * 1024 * 1024, // 5MB
+    allowedTypes: [
+      'image/jpeg',
+      'image/jpg',
+      'image/png',
+      'image/webp'
+    ],
+    maxFiles: 1
+  }
+};
+
+// Validate file against rules
+export const validateFile = (file: File, validation: FileValidation): { valid: boolean; error?: string } => {
+  // Check file size
+  if (file.size > validation.maxSize) {
+    const maxSizeMB = Math.round(validation.maxSize / (1024 * 1024));
+    const currentSizeMB = Math.round(file.size / (1024 * 1024));
+    return {
+      valid: false,
+      error: `File "${file.name}" is too large. Maximum size: ${maxSizeMB}MB, current size: ${currentSizeMB}MB`
+    };
+  }
+
+  // Check file type
+  if (!validation.allowedTypes.includes(file.type)) {
+    const allowedExtensions = validation.allowedTypes
+      .map(type => type.split('/')[1])
+      .join(', ');
+    return {
+      valid: false,
+      error: `File type not allowed for "${file.name}". Allowed types: ${allowedExtensions}`
+    };
+  }
+
+  return { valid: true };
+};
+
+// Validate multiple files
+export const validateFiles = (files: File[], validation: FileValidation): { valid: boolean; errors: string[] } => {
+  const errors: string[] = [];
+
+  // Check number of files
+  if (validation.maxFiles && files.length > validation.maxFiles) {
+    errors.push(`Maximum ${validation.maxFiles} files allowed. You selected ${files.length} files.`);
+  }
+
+  // Validate each file
+  files.forEach((file) => {
+    const result = validateFile(file, validation);
+    if (!result.valid) {
+      errors.push(result.error!);
+    }
+  });
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+};
+
+// Generate unique file name with user folder structure
+export const generateFileName = (originalName: string, userId: string): string => {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(2, 8);
+  const extension = originalName.split('.').pop();
+  const baseName = originalName
+    .split('.').slice(0, -1).join('.')
+    .replace(/[^a-zA-Z0-9-_]/g, '_')
+    .substring(0, 50);
+  
+  return `${userId}/${timestamp}_${random}_${baseName}.${extension}`;
+};
+
+// Upload single file to Supabase Storage
+export const uploadFile = async (
+  file: File, 
+  bucket: string, 
+  userId: string,
+  validation: FileValidation,
+  onProgress?: (progress: number) => void
+): Promise<UploadResult> => {
+  try {
+    // Validate file first
+    const validationResult = validateFile(file, validation);
+    if (!validationResult.valid) {
+      return {
+        success: false,
+        error: validationResult.error,
+        fileName: file.name
+      };
+    }
+
+    // FAIL LOUDLY if Supabase storage is not configured
+    if (!supabase) {
+      throw new Error('File storage is not configured. Please set up Supabase credentials.');
+    }
+
+    // Try Supabase upload with error handling
+    try {
+      // Generate unique file path
+      const filePath = generateFileName(file.name, userId);
+
+      // Report initial progress
+      if (onProgress) onProgress(10);
+
+      // Upload to Supabase Storage
+      const { data, error } = await supabase.storage
+        .from(bucket)
+        .upload(filePath, file, {
+          cacheControl: '3600',
+          upsert: false
+        });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      // Report progress
+      if (onProgress) onProgress(80);
+
+      // Get public URL for public buckets, or signed URL for private buckets
+      let publicUrl: string;
+      
+      if (bucket === 'images' || bucket === 'avatars') {
+        // Public buckets - get public URL
+        const { data: urlData } = supabase.storage
+          .from(bucket)
+          .getPublicUrl(filePath);
+        publicUrl = urlData.publicUrl;
+      } else {
+        // Private buckets - create signed URL (valid for 1 year)
+        const { data: signedData, error: signedError } = await supabase.storage
+          .from(bucket)
+          .createSignedUrl(filePath, 31536000); // 1 year
+
+        if (signedError) {
+          throw new Error(signedError.message);
+        }
+        
+        publicUrl = signedData.signedUrl;
+      }
+
+      // Final progress
+      if (onProgress) onProgress(100);
+
+      return {
+        success: true,
+        url: publicUrl,
+        fileName: file.name,
+        filePath: filePath
+      };
+
+    } catch (supabaseError) {
+      // NO FALLBACK - fail loudly so user knows storage is broken
+      console.error('Supabase upload failed:', supabaseError);
+      throw supabaseError;
+    }
+
+  } catch (error) {
+    console.error('Upload error:', error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Upload failed',
+      fileName: file.name
+    };
+  }
+};
+
+// Upload multiple files with progress tracking
+export const uploadFiles = async (
+  files: File[],
+  bucket: string,
+  userId: string,
+  validation: FileValidation,
+  onProgress?: (progress: number) => void
+): Promise<UploadResult[]> => {
+  // Validate all files first
+  const validationResult = validateFiles(files, validation);
+  if (!validationResult.valid) {
+    return validationResult.errors.map(error => ({
+      success: false,
+      error
+    }));
+  }
+
+  const results: UploadResult[] = [];
+  
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    
+    const result = await uploadFile(
+      file, 
+      bucket, 
+      userId, 
+      validation,
+      (fileProgress) => {
+        // Calculate overall progress
+        const overallProgress = ((i / files.length) * 100) + (fileProgress / files.length);
+        if (onProgress) onProgress(Math.min(overallProgress, 100));
+      }
+    );
+    
+    results.push(result);
+  }
+
+  return results;
+};
+
+// Delete file from Supabase Storage
+export const deleteFile = async (bucket: string, filePath: string): Promise<{ success: boolean; error?: string }> => {
+  try {
+    if (!supabase) {
+      throw new Error('File storage is not configured');
+    }
+
+    const { error } = await supabase.storage
+      .from(bucket)
+      .remove([filePath]);
+
+    if (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Delete failed'
+    };
+  }
+};
+
+// Get secure download URL for purchased resources
+export const getSecureDownloadUrl = async (
+  bucket: string,
+  filePath: string,
+  expiresIn: number = 3600
+): Promise<{ success: boolean; url?: string; error?: string }> => {
+  try {
+    if (!supabase) {
+      throw new Error('File storage is not configured');
+    }
+
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .createSignedUrl(filePath, expiresIn);
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return {
+      success: true,
+      url: data.signedUrl
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to get download URL'
+    };
+  }
+};
+
+// Helper function to format file size
+export const formatFileSize = (bytes: number): string => {
+  if (bytes === 0) return '0 Bytes';
+  
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+// Helper function to get file type icon
+export const getFileTypeIcon = (fileName: string): string => {
+  const extension = fileName.split('.').pop()?.toLowerCase();
+  
+  switch (extension) {
+    case 'pdf':
+      return '📄';
+    case 'doc':
+    case 'docx':
+      return '📝';
+    case 'ppt':
+    case 'pptx':
+      return '📊';
+    case 'xls':
+    case 'xlsx':
+      return '📈';
+    case 'jpg':
+    case 'jpeg':
+    case 'png':
+    case 'gif':
+    case 'webp':
+      return '🖼️';
+    case 'txt':
+      return '📄';
+    default:
+      return '📎';
+  }
+};
+
+// Helper to check if file is an image
+export const isImageFile = (fileName: string): boolean => {
+  const extension = fileName.split('.').pop()?.toLowerCase();
+  return ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(extension || '');
+};
+
+// Helper to get file extension
+export const getFileExtension = (fileName: string): string => {
+  return fileName.split('.').pop()?.toLowerCase() || '';
+};
+// Local storage utilities for Coach2Coach platform
+export interface CoachProfile {
+  id: string;
+  userId: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  title: string;
+  bio: string;
+  location: string;
+  yearsExperience: string;
+  sports: string[];
+  levels: string[];
+  specialties: string[];
+  achievements: string[];
+  website?: string;
+  socialLinks: {
+    twitter?: string;
+    instagram?: string;
+    linkedin?: string;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface User {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  createdAt: string;
+}
+
+export interface Resource {
+  id: string;
+  coachId: string;
+  title: string;
+  description: string;
+  price: number;
+  sports: string[];
+  levels: string[];
+  category: string;
+  fileUrls?: string[];
+  previewImages?: string[];
+  status: 'pending' | 'active' | 'rejected' | 'inactive';
+  downloads: number;
+  rating: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// User management
+export const userStorage = {
+  getUsers: (): User[] => {
+    const users = localStorage.getItem('coach2coach_users');
+    return users ? JSON.parse(users) : [];
+  },
+
+  saveUser: (user: User): void => {
+    const users = userStorage.getUsers();
+    const existingIndex = users.findIndex(u => u.id === user.id);
+    
+    if (existingIndex >= 0) {
+      users[existingIndex] = user;
+    } else {
+      users.push(user);
+    }
+    
+    localStorage.setItem('coach2coach_users', JSON.stringify(users));
+  },
+
+  getUserByEmail: (email: string): User | null => {
+    const users = userStorage.getUsers();
+    return users.find(u => u.email === email) || null;
+  },
+
+  getUserById: (id: string): User | null => {
+    const users = userStorage.getUsers();
+    return users.find(u => u.id === id) || null;
+  }
+};
+
+// Session management
+export const sessionStorage = {
+  getCurrentUser: (): User | null => {
+    const session = localStorage.getItem('coach2coach_session');
+    if (!session) return null;
+    
+    const { userId } = JSON.parse(session);
+    return userStorage.getUserById(userId);
+  },
+
+  setCurrentUser: (user: User): void => {
+    localStorage.setItem('coach2coach_session', JSON.stringify({ userId: user.id }));
+  },
+
+  clearSession: (): void => {
+    localStorage.removeItem('coach2coach_session');
+  }
+};
+
+// Coach profile management
+export const profileStorage = {
+  getProfiles: (): CoachProfile[] => {
+    const profiles = localStorage.getItem('coach2coach_profiles');
+    return profiles ? JSON.parse(profiles) : [];
+  },
+
+  saveProfile: (profile: CoachProfile): void => {
+    try {
+      console.log('Attempting to save profile:', profile);
+      const profiles = profileStorage.getProfiles();
+      const existingIndex = profiles.findIndex(p => p.id === profile.id);
+      
+      if (existingIndex >= 0) {
+        profiles[existingIndex] = { ...profile, updatedAt: new Date().toISOString() };
+        console.log('Updated existing profile at index:', existingIndex);
+      } else {
+        profiles.push(profile);
+        console.log('Added new profile, total profiles:', profiles.length);
+      }
+      
+      localStorage.setItem('coach2coach_profiles', JSON.stringify(profiles));
+      console.log('Profile saved to localStorage successfully');
+    } catch (error) {
+      console.error('Error in saveProfile:', error);
+      throw error;
+    }
+  },
+
+  getProfileByUserId: (userId: string): CoachProfile | null => {
+    try {
+      const profiles = profileStorage.getProfiles();
+      const profile = profiles.find(p => p.userId === userId) || null;
+      console.log('Retrieved profile for userId:', userId, profile);
+      return profile;
+    } catch (error) {
+      console.error('Error in getProfileByUserId:', error);
+      return null;
+    }
+  },
+
+  getProfileById: (id: string): CoachProfile | null => {
+    try {
+      const profiles = profileStorage.getProfiles();
+      const profile = profiles.find(p => p.id === id) || null;
+      console.log('Retrieved profile for id:', id, profile);
+      return profile;
+    } catch (error) {
+      console.error('Error in getProfileById:', error);
+      return null;
+    }
+  }
+};
+
+// Resource management
+export const resourceStorage = {
+  getResources: (): Resource[] => {
+    const resources = localStorage.getItem('coach2coach_resources');
+    return resources ? JSON.parse(resources) : [];
+  },
+
+  saveResource: (resource: Resource): void => {
+    const resources = resourceStorage.getResources();
+    const existingIndex = resources.findIndex(r => r.id === resource.id);
+    
+    if (existingIndex >= 0) {
+      resources[existingIndex] = { ...resource, updatedAt: new Date().toISOString() };
+    } else {
+      resources.push(resource);
+    }
+    
+    localStorage.setItem('coach2coach_resources', JSON.stringify(resources));
+  },
+
+  getResourcesByCoachId: (coachId: string): Resource[] => {
+    const resources = resourceStorage.getResources();
+    return resources.filter(r => r.coachId === coachId);
+  },
+
+  getActiveResources: (): Resource[] => {
+    const resources = resourceStorage.getResources();
+    return resources.filter(r => r.status === 'active');
+  }
+};
+
+// Utility functions
+export const generateId = (): string => {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2);
+};
+
+// Initialize with sample data if empty
+export const initializeSampleData = (): void => {
+  // Add sample data for testing if none exists
+  const existingUsers = userStorage.getUsers();
+  const existingProfiles = profileStorage.getProfiles();
+  const existingResources = resourceStorage.getResources();
+  
+  // Only add sample data if database is empty
+  if (existingUsers.length === 0) {
+    // Sample users
+    const sampleUsers: User[] = [
+      {
+        id: 'user1',
+        email: 'mike.johnson@email.com',
+        firstName: 'Mike',
+        lastName: 'Johnson',
+        createdAt: '2024-01-01T10:00:00Z'
+      },
+      {
+        id: 'user2',
+        email: 'sarah.williams@email.com',
+        firstName: 'Sarah',
+        lastName: 'Williams',
+        createdAt: '2024-01-02T10:00:00Z'
+      },
+      {
+        id: 'user3',
+        email: 'tom.davis@email.com',
+        firstName: 'Tom',
+        lastName: 'Davis',
+        createdAt: '2024-01-03T10:00:00Z'
+      }
+    ];
+    
+    sampleUsers.forEach(user => userStorage.saveUser(user));
+  }
+  
+  if (existingProfiles.length === 0) {
+    // Sample coach profiles
+    const sampleProfiles: CoachProfile[] = [
+      {
+        id: 'coach1',
+        userId: 'user1',
+        firstName: 'Chan',
+        lastName: 'Brown',
+        email: 'chan.brown@email.com',
+        title: 'Baseball Coach & Skills Development Specialist',
+        bio: 'Experienced baseball coach with a passion for developing young athletes and teaching fundamental skills. Specializing in hitting mechanics, fielding techniques, and game strategy.',
+        location: 'Atlanta, GA',
+        yearsExperience: '6-10',
+        sports: ['Baseball'],
+        levels: ['Youth (Ages 6-12)', 'Middle School', 'High School', 'Travel/Club'],
+        specialties: ['Hitting Mechanics', 'Fielding', 'Player Development', 'Game Strategy'],
+        achievements: [
+          'Regional Championship Winner 2023',
+          'Coach of the Year - Georgia Baseball League 2022',
+          'Developed 12+ players who earned college scholarships',
+          'Former College Baseball Player'
+        ],
+        website: '',
+        socialLinks: {
+          twitter: '@CoachChanB',
+          instagram: '@chanbrownbaseball'
+        },
+        createdAt: '2024-01-01T10:00:00Z',
+        updatedAt: '2024-01-01T10:00:00Z'
+      },
+      {
+        id: 'coach2',
+        userId: 'user2',
+        firstName: 'Robby',
+        lastName: 'Gilbert',
+        email: 'robby.gilbert@email.com',
+        title: 'Baseball Coach & Pitching Specialist',
+        bio: 'Dedicated baseball coach specializing in pitching mechanics and player development. Expert in training young pitchers and developing arm strength safely.',
+        location: 'Birmingham, AL',
+        yearsExperience: '11-15',
+        sports: ['Baseball'],
+        levels: ['Middle School', 'High School', 'Travel/Club'],
+        specialties: ['Pitching Mechanics', 'Arm Care', 'Player Development', 'Mental Training'],
+        achievements: [
+          'State Championship 2023',
+          'Developed 8+ college pitchers',
+          'Certified Pitching Instructor',
+          'Perfect Safety Record - 10 years'
+        ],
+        website: '',
+        socialLinks: {
+          twitter: '@CoachRobbyG',
+          instagram: '@robbygilbertbaseball'
+        },
+        createdAt: '2024-01-02T10:00:00Z',
+        updatedAt: '2024-01-02T10:00:00Z'
+      },
+      {
+        id: 'coach3',
+        userId: 'user3',
+        firstName: 'Jamie',
+        lastName: 'Suggs',
+        email: 'jamie.suggs@email.com',
+        title: 'Baseball Coach & Hitting Instructor',
+        bio: 'Passionate baseball coach focused on hitting instruction and offensive strategy. Specializes in developing young hitters and improving batting averages.',
+        location: 'Nashville, TN',
+        yearsExperience: '6-10',
+        sports: ['Baseball'],
+        levels: ['Youth (Ages 6-12)', 'Middle School', 'High School'],
+        specialties: ['Hitting Instruction', 'Offensive Strategy', 'Player Development', 'Fundamentals'],
+        achievements: [
+          'Regional Championship 2022',
+          'Hitting Instructor Certification',
+          'Developed 15+ .300+ hitters',
+          'Team Batting Average Leader 3 years'
+        ],
+        website: '',
+        socialLinks: {
+          instagram: '@jamiesuggsbaseball'
+        },
+        createdAt: '2024-01-03T10:00:00Z',
+        updatedAt: '2024-01-03T10:00:00Z'
+      },
+      {
+        id: 'coach4',
+        userId: 'user4',
+        firstName: 'Willie',
+        lastName: 'Hildebrand',
+        email: 'willie.hildebrand@email.com',
+        title: 'Swimming Coach & Technique Specialist',
+        bio: 'Experienced swimming coach with expertise in stroke technique, training programs, and competitive swimming. Focused on developing swimmers at all levels.',
+        location: 'Austin, TX',
+        yearsExperience: '11-15',
+        sports: ['Swimming'],
+        levels: ['Youth (Ages 6-12)', 'Middle School', 'High School', 'Collegiate'],
+        specialties: ['Stroke Technique', 'Training Programs', 'Competitive Swimming', 'Conditioning'],
+        achievements: [
+          'State Championship Coach 2023',
+          'USA Swimming Certified',
+          'Developed 20+ state qualifiers',
+          'Masters Swimming Instructor'
+        ],
+        website: '',
+        socialLinks: {
+          twitter: '@CoachWillieH'
+        },
+        createdAt: '2024-01-04T10:00:00Z',
+        updatedAt: '2024-01-04T10:00:00Z'
+      },
+      {
+        id: 'coach5',
+        userId: 'user5',
+        firstName: 'P.J.',
+        lastName: 'Katz',
+        email: 'pj.katz@email.com',
+        title: 'Football Coach & Offensive Coordinator',
+        bio: 'Football coach specializing in offensive strategy and quarterback development. Expert in play calling, game planning, and developing young quarterbacks.',
+        location: 'Dallas, TX',
+        yearsExperience: '11-15',
+        sports: ['Football'],
+        levels: ['High School', 'Travel/Club', 'Collegiate'],
+        specialties: ['Offensive Strategy', 'Quarterback Development', 'Play Calling', 'Game Planning'],
+        achievements: [
+          'District Championship 2023',
+          'Offensive Coordinator of the Year 2022',
+          'Developed 5+ college quarterbacks',
+          'High School Coaching Certification'
+        ],
+        website: '',
+        socialLinks: {
+          twitter: '@CoachPJKatz'
+        },
+        createdAt: '2024-01-05T10:00:00Z',
+        updatedAt: '2024-01-05T10:00:00Z'
+      },
+      {
+        id: 'coach6',
+        userId: 'user6',
+        firstName: 'Trae',
+        lastName: 'Owens',
+        email: 'trae.owens@email.com',
+        title: 'Football Coach & Defensive Specialist',
+        bio: 'Football coach focused on defensive strategy and player development. Specializes in developing strong defensive units and teaching fundamentals.',
+        location: 'Houston, TX',
+        yearsExperience: '6-10',
+        sports: ['Football'],
+        levels: ['Middle School', 'High School', 'Travel/Club'],
+        specialties: ['Defensive Strategy', 'Player Development', 'Fundamentals', 'Team Building'],
+        achievements: [
+          'Regional Defense Leader 2023',
+          'Defensive Coordinator Certification',
+          'Led top-ranked defense 2 years',
+          'Youth Football Safety Certified'
+        ],
+        website: '',
+        socialLinks: {
+          instagram: '@traeowensfootball'
+        },
+        createdAt: '2024-01-06T10:00:00Z',
+        updatedAt: '2024-01-06T10:00:00Z'
+      },
+      {
+        id: 'coach7',
+        userId: 'user7',
+        firstName: 'Ryan',
+        lastName: 'Sutton',
+        email: 'ryan.sutton@email.com',
+        title: 'Soccer Coach & Tactical Specialist',
+        bio: 'Soccer coach with expertise in tactical training, team coordination, and player development. Focused on developing technical skills and game understanding.',
+        location: 'Seattle, WA',
+        yearsExperience: '6-10',
+        sports: ['Soccer'],
+        levels: ['Youth (Ages 6-12)', 'Middle School', 'High School'],
+        specialties: ['Tactical Training', 'Technical Skills', 'Player Development', 'Game Strategy'],
+        achievements: [
+          'State Cup Winner 2023',
+          'USSF Coaching License',
+          'Developed 10+ college players',
+          'Regional Coach of the Year 2022'
+        ],
+        website: '',
+        socialLinks: {
+          twitter: '@CoachRyanS',
+          instagram: '@ryansuttonsoccer'
+        },
+        createdAt: '2024-01-07T10:00:00Z',
+        updatedAt: '2024-01-07T10:00:00Z'
+      }
+    ];
+    
+    sampleProfiles.forEach(profile => profileStorage.saveProfile(profile));
+  }
+  
+  if (existingUsers.length === 0) {
+    // Add corresponding users for the coaches
+    const additionalUsers: User[] = [
+      {
+        id: 'user4',
+        email: 'willie.hildebrand@email.com',
+        firstName: 'Willie',
+        lastName: 'Hildebrand',
+        createdAt: '2024-01-04T10:00:00Z'
+      },
+      {
+        id: 'user5',
+        email: 'pj.katz@email.com',
+        firstName: 'P.J.',
+        lastName: 'Katz',
+        createdAt: '2024-01-05T10:00:00Z'
+      },
+      {
+        id: 'user6',
+        email: 'trae.owens@email.com',
+        firstName: 'Trae',
+        lastName: 'Owens',
+        createdAt: '2024-01-06T10:00:00Z'
+      },
+      {
+        id: 'user7',
+        email: 'ryan.sutton@email.com',
+        firstName: 'Ryan',
+        lastName: 'Sutton',
+        createdAt: '2024-01-07T10:00:00Z'
+      }
+    ];
+    
+    additionalUsers.forEach(user => userStorage.saveUser(user));
+  }
+  
+  // Clear any existing resources to start fresh
+  localStorage.removeItem('coach2coach_resources');
+}
+// Membership utilities for Coach2Coach platform with strict access control
+
+export type MembershipStatus = 'none' | 'trial' | 'active' | 'past_due' | 'canceled';
+
+export interface UserMembership {
+  membershipStatus: MembershipStatus;
+  membershipTrialEndsAt?: string;
+  membershipCurrentPeriodEnd?: string;
+  isCreatorEnabled: boolean;
+  stripeCustomerId?: string;
+  stripeConnectId?: string;
+}
+
+// Check if user can upload or sell resources (ACTIVE + creator enabled only)
+export function canUploadOrSell(membership: UserMembership): boolean {
+  return membership.membershipStatus === 'active' && membership.isCreatorEnabled;
+}
+
+// Check if user can purchase resources (ACTIVE only)
+export function canPurchase(membership: UserMembership): boolean {
+  return membership.membershipStatus === 'active';
+}
+
+// Check if user can download full resources (ACTIVE only, or within grace period)
+export function canDownloadFull(membership: UserMembership, gracePeriodDays: number = 7): boolean {
+  if (membership.membershipStatus === 'active') {
+    return true;
+  }
+  
+  // Grace period for past_due members
+  if (membership.membershipStatus === 'past_due' && membership.membershipCurrentPeriodEnd) {
+    const gracePeriodEnd = new Date(membership.membershipCurrentPeriodEnd);
+    gracePeriodEnd.setDate(gracePeriodEnd.getDate() + gracePeriodDays);
+    return new Date() <= gracePeriodEnd;
+  }
+  
+  return false;
+}
+
+// Check if user is in trial period
+export function isInTrial(membership: UserMembership): boolean {
+  if (membership.membershipStatus !== 'trial') return false;
+  
+  if (membership.membershipTrialEndsAt) {
+    return new Date(membership.membershipTrialEndsAt) > new Date();
+  }
+  
+  return false;
+}
+
+// Check if user has any form of access (trial or active)
+export function hasAnyAccess(membership: UserMembership): boolean {
+  return isInTrial(membership) || membership.membershipStatus === 'active';
+}
+
+// Get days remaining in trial
+export function getTrialDaysRemaining(membership: UserMembership): number {
+  if (!membership.membershipTrialEndsAt) return 0;
+  
+  const now = new Date();
+  const trialEnd = new Date(membership.membershipTrialEndsAt);
+  const diffTime = trialEnd.getTime() - now.getTime();
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  
+  return Math.max(0, diffDays);
+}
+
+// Get membership status display text
+export function getMembershipStatusText(status: MembershipStatus): string {
+  switch (status) {
+    case 'none':
+      return 'No Membership';
+    case 'trial':
+      return 'Free Trial';
+    case 'active':
+      return 'Active Member';
+    case 'past_due':
+      return 'Payment Past Due';
+    case 'canceled':
+      return 'Canceled';
+    default:
+      return 'Unknown';
+  }
+}
+
+// Get membership status color classes
+export function getMembershipStatusColor(status: MembershipStatus): string {
+  switch (status) {
+    case 'none':
+      return 'text-gray-600 bg-gray-100';
+    case 'trial':
+      return 'text-blue-600 bg-blue-100';
+    case 'active':
+      return 'text-green-600 bg-green-100';
+    case 'past_due':
+      return 'text-red-600 bg-red-100';
+    case 'canceled':
+      return 'text-gray-600 bg-gray-100';
+    default:
+      return 'text-gray-600 bg-gray-100';
+  }
+}
+
+// Get access level description
+export function getAccessDescription(membership: UserMembership): string {
+  if (membership.membershipStatus === 'active') {
+    return 'Full access to all features';
+  }
+  
+  if (isInTrial(membership)) {
+    const daysRemaining = getTrialDaysRemaining(membership);
+    return `Trial access - ${daysRemaining} days remaining`;
+  }
+  
+  if (membership.membershipStatus === 'past_due') {
+    return 'Limited access - payment required';
+  }
+  
+  return 'Preview access only';
+}
+
+// Check if user needs to upgrade
+export function needsUpgrade(membership: UserMembership, action: 'upload' | 'purchase' | 'download'): boolean {
+  switch (action) {
+    case 'upload':
+      return !canUploadOrSell(membership);
+    case 'purchase':
+      return !canPurchase(membership);
+    case 'download':
+      return !canDownloadFull(membership);
+    default:
+      return false;
+  }
+}
+
+// Get upgrade message for specific action
+export function getUpgradeMessage(membership: UserMembership, action: 'upload' | 'purchase' | 'download'): string {
+  const isTrialUser = isInTrial(membership);
+  
+  switch (action) {
+    case 'upload':
+      if (isTrialUser) {
+        return 'Upgrade to an active membership to upload and sell resources';
+      }
+      if (!membership.isCreatorEnabled) {
+        return 'Complete seller onboarding to upload resources';
+      }
+      return 'Active membership required to upload resources';
+      
+    case 'purchase':
+      if (isTrialUser) {
+        return 'Upgrade to an active membership to purchase resources';
+      }
+      return 'Active membership required to purchase resources';
+      
+    case 'download':
+      if (isTrialUser) {
+        return 'Upgrade to an active membership for full downloads';
+      }
+      return 'Active membership required for full downloads';
+      
+    default:
+      return 'Active membership required';
+  }
+}
+// Real-time messaging system for Coach2Coach
+import { supabase } from './supabase';
+import { generateId } from './localStorage';
+
+export interface Conversation {
+  id: string;
+  type: 'dm' | 'resource';
+  resourceId?: string;
+  title: string;
+  participants: ConversationParticipant[];
+  lastMessage?: Message;
+  unreadCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationParticipant {
+  id: string;
+  conversationId: string;
+  userId: string;
+  isMuted: boolean;
+  lastReadAt: string;
+  joinedAt: string;
+}
+
+export interface Message {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  body: string;
+  attachmentPath?: string;
+  attachmentType?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Block {
+  id: string;
+  blockerId: string;
+  blockedId: string;
+  createdAt: string;
+}
+
+// Discussion Board interfaces
+export interface DiscussionBoard {
+  id: string;
+  title: string;
+  description: string;
+  category: string;
+  sport?: string;
+  level?: string;
+  creatorId: string;
+  isPinned: boolean;
+  isLocked: boolean;
+  postCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DiscussionPost {
+  id: string;
+  boardId: string;
+  title: string;
+  content: string;
+  authorId: string;
+  postType: 'discussion' | 'question' | 'resource_share';
+  isPinned: boolean;
+  upvotes: number;
+  downvotes: number;
+  replyCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DiscussionReply {
+  id: string;
+  postId: string;
+  content: string;
+  authorId: string;
+  upvotes: number;
+  downvotes: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Local storage keys for demo mode
+const STORAGE_KEYS = {
+  conversations: 'coach2coach_conversations',
+  messages: 'coach2coach_messages',
+  blocks: 'coach2coach_blocks',
+  discussionBoards: 'coach2coach_discussion_boards',
+  discussionPosts: 'coach2coach_discussion_posts',
+  discussionReplies: 'coach2coach_discussion_replies'
+};
+
+// Messaging functions
+export const messaging = {
+  // Get all conversations for a user
+  getConversations: async (userId: string): Promise<Conversation[]> => {
+    if (!supabase) {
+      const conversations = JSON.parse(localStorage.getItem(STORAGE_KEYS.conversations) || '[]');
+      return conversations.filter((c: any) => 
+        c.participants.some((p: any) => p.userId === userId)
+      );
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('conversations')
+        .select(`
+          *,
+          conversation_participants!inner(
+            user_id,
+            is_muted,
+            last_read_at,
+            joined_at
+          )
+        `)
+        .eq('conversation_participants.user_id', userId)
+        .order('updated_at', { ascending: false });
+
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('Error loading conversations:', error);
+      // Fallback to localStorage
+      const conversations = JSON.parse(localStorage.getItem(STORAGE_KEYS.conversations) || '[]');
+      return conversations.filter((c: any) => 
+        c.participants.some((p: any) => p.userId === userId)
+      );
+    }
+  },
+
+  // Create a new conversation
+  createConversation: async (
+    type: 'dm' | 'resource',
+    participantIds: string[],
+    resourceId?: string,
+    title?: string
+  ): Promise<Conversation> => {
+    const conversation = {
+      id: generateId(),
+      type,
+      resourceId,
+      title: title || '',
+      participants: participantIds.map(userId => ({
+        id: generateId(),
+        conversationId: '',
+        userId,
+        isMuted: false,
+        lastReadAt: new Date().toISOString(),
+        joinedAt: new Date().toISOString()
+      })),
+      unreadCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    if (!supabase) {
+      const conversations = JSON.parse(localStorage.getItem(STORAGE_KEYS.conversations) || '[]');
+      conversations.push(conversation);
+      localStorage.setItem(STORAGE_KEYS.conversations, JSON.stringify(conversations));
+      return conversation;
+    }
+
+    try {
+      // Create conversation
+      const { data: newConversation, error: convError } = await supabase
+        .from('conversations')
+        .insert([{
+          type,
+          resource_id: resourceId,
+          title: title || ''
+        }])
+        .select()
+        .single();
+
+      if (convError) throw convError;
+
+      // Add participants
+      const participantData = participantIds.map(userId => ({
+        conversation_id: newConversation.id,
+        user_id: userId
+      }));
+
+      const { error: participantError } = await supabase
+        .from('conversation_participants')
+        .insert(participantData);
+
+      if (participantError) throw participantError;
+
+      return {
+        ...conversation,
+        id: newConversation.id
+      };
+    } catch (error) {
+      console.error('Error creating conversation:', error);
+      // Fallback to localStorage
+      const conversations = JSON.parse(localStorage.getItem(STORAGE_KEYS.conversations) || '[]');
+      conversations.push(conversation);
+      localStorage.setItem(STORAGE_KEYS.conversations, JSON.stringify(conversations));
+      return conversation;
+    }
+  },
+
+  // Get messages for a conversation
+  getMessages: async (conversationId: string, limit: number = 50): Promise<Message[]> => {
+    if (!supabase) {
+      const messages = JSON.parse(localStorage.getItem(STORAGE_KEYS.messages) || '[]');
+      return messages
+        .filter((m: Message) => m.conversationId === conversationId)
+        .slice(-limit);
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+
+      if (error) throw error;
+      return (data || []).reverse();
+    } catch (error) {
+      console.error('Error loading messages:', error);
+      // Fallback to localStorage
+      const messages = JSON.parse(localStorage.getItem(STORAGE_KEYS.messages) || '[]');
+      return messages
+        .filter((m: Message) => m.conversationId === conversationId)
+        .slice(-limit);
+    }
+  },
+
+  // Send a message
+  sendMessage: async (message: Omit<Message, 'id' | 'createdAt' | 'updatedAt'>): Promise<Message> => {
+    const newMessage: Message = {
+      ...message,
+      id: generateId(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    if (!supabase) {
+      const messages = JSON.parse(localStorage.getItem(STORAGE_KEYS.messages) || '[]');
+      messages.push(newMessage);
+      localStorage.setItem(STORAGE_KEYS.messages, JSON.stringify(messages));
+      return newMessage;
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('messages')
+        .insert([{
+          conversation_id: message.conversationId,
+          sender_id: message.senderId,
+          body: message.body,
+          attachment_path: message.attachmentPath,
+          attachment_type: message.attachmentType
+        }])
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Update conversation timestamp
+      await supabase
+        .from('conversations')
+        .update({ updated_at: new Date().toISOString() })
+        .eq('id', message.conversationId);
+
+      return {
+        id: data.id,
+        conversationId: data.conversation_id,
+        senderId: data.sender_id,
+        body: data.body,
+        attachmentPath: data.attachment_path,
+        attachmentType: data.attachment_type,
+        createdAt: data.created_at,
+        updatedAt: data.updated_at
+      };
+    } catch (error) {
+      console.error('Error sending message:', error);
+      // Fallback to localStorage
+      const messages = JSON.parse(localStorage.getItem(STORAGE_KEYS.messages) || '[]');
+      messages.push(newMessage);
+      localStorage.setItem(STORAGE_KEYS.messages, JSON.stringify(messages));
+      return newMessage;
+    }
+  },
+
+  // Mark conversation as read
+  markAsRead: async (conversationId: string, userId: string): Promise<void> => {
+    if (!supabase) {
+      // Update localStorage participant data
+      const conversations = JSON.parse(localStorage.getItem(STORAGE_KEYS.conversations) || '[]');
+      const updatedConversations = conversations.map((c: any) => {
+        if (c.id === conversationId) {
+          return {
+            ...c,
+            participants: c.participants.map((p: any) => 
+              p.userId === userId 
+                ? { ...p, lastReadAt: new Date().toISOString() }
+                : p
+            )
+          };
+        }
+        return c;
+      });
+      localStorage.setItem(STORAGE_KEYS.conversations, JSON.stringify(updatedConversations));
+      return;
+    }
+
+    try {
+      await supabase
+        .from('conversation_participants')
+        .update({ last_read_at: new Date().toISOString() })
+        .eq('conversation_id', conversationId)
+        .eq('user_id', userId);
+    } catch (error) {
+      console.error('Error marking as read:', error);
+    }
+  },
+
+  // Block/unblock user
+  blockUser: async (blockerId: string, blockedId: string): Promise<void> => {
+    if (!supabase) {
+      const blocks = JSON.parse(localStorage.getItem(STORAGE_KEYS.blocks) || '[]');
+      blocks.push({
+        id: generateId(),
+        blockerId,
+        blockedId,
+        createdAt: new Date().toISOString()
+      });
+      localStorage.setItem(STORAGE_KEYS.blocks, JSON.stringify(blocks));
+      return;
+    }
+
+    try {
+      await supabase
+        .from('blocks')
+        .insert([{
+          blocker_id: blockerId,
+          blocked_id: blockedId
+        }]);
+    } catch (error) {
+      console.error('Error blocking user:', error);
+    }
+  },
+
+  unblockUser: async (blockerId: string, blockedId: string): Promise<void> => {
+    if (!supabase) {
+      const blocks = JSON.parse(localStorage.getItem(STORAGE_KEYS.blocks) || '[]');
+      const filteredBlocks = blocks.filter((b: any) => 
+        !(b.blockerId === blockerId && b.blockedId === blockedId)
+      );
+      localStorage.setItem(STORAGE_KEYS.blocks, JSON.stringify(filteredBlocks));
+      return;
+    }
+
+    try {
+      await supabase
+        .from('blocks')
+        .delete()
+        .eq('blocker_id', blockerId)
+        .eq('blocked_id', blockedId);
+    } catch (error) {
+      console.error('Error unblocking user:', error);
+    }
+  },
+
+  // Check if user is blocked
+  isBlocked: async (userId1: string, userId2: string): Promise<boolean> => {
+    if (!supabase) {
+      const blocks = JSON.parse(localStorage.getItem(STORAGE_KEYS.blocks) || '[]');
+      return blocks.some((b: any) => 
+        (b.blockerId === userId1 && b.blockedId === userId2) ||
+        (b.blockerId === userId2 && b.blockedId === userId1)
+      );
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('blocks')
+        .select('id')
+        .or(`and(blocker_id.eq.${userId1},blocked_id.eq.${userId2}),and(blocker_id.eq.${userId2},blocked_id.eq.${userId1})`)
+        .limit(1);
+
+      if (error) throw error;
+      return (data || []).length > 0;
+    } catch (error) {
+      console.error('Error checking block status:', error);
+      return false;
+    }
+  }
+};
+
+// Discussion functions
+export const discussions = {
+  // Get all discussion boards
+  getBoards: async (): Promise<DiscussionBoard[]> => {
+    if (!supabase) {
+      const boards = JSON.parse(localStorage.getItem(STORAGE_KEYS.discussionBoards) || '[]');
+      return boards;
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('discussion_boards')
+        .select('*')
+        .order('is_pinned', { ascending: false })
+        .order('updated_at', { ascending: false });
+
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('Error loading discussion boards:', error);
+      const boards = JSON.parse(localStorage.getItem(STORAGE_KEYS.discussionBoards) || '[]');
+      return boards;
+    }
+  },
+
+  // Get posts for a board
+  getPosts: async (boardId: string): Promise<DiscussionPost[]> => {
+    if (!supabase) {
+      const posts = JSON.parse(localStorage.getItem(STORAGE_KEYS.discussionPosts) || '[]');
+      return posts.filter((p: DiscussionPost) => p.boardId === boardId);
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('discussion_posts')
+        .select('*')
+        .eq('board_id', boardId)
+        .order('is_pinned', { ascending: false })
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('Error loading discussion posts:', error);
+      const posts = JSON.parse(localStorage.getItem(STORAGE_KEYS.discussionPosts) || '[]');
+      return posts.filter((p: DiscussionPost) => p.boardId === boardId);
+    }
+  },
+
+  // Get replies for a post
+  getReplies: async (postId: string): Promise<DiscussionReply[]> => {
+    if (!supabase) {
+      const replies = JSON.parse(localStorage.getItem(STORAGE_KEYS.discussionReplies) || '[]');
+      return replies.filter((r: DiscussionReply) => r.postId === postId);
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('discussion_replies')
+        .select('*')
+        .eq('post_id', postId)
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('Error loading discussion replies:', error);
+      const replies = JSON.parse(localStorage.getItem(STORAGE_KEYS.discussionReplies) || '[]');
+      return replies.filter((r: DiscussionReply) => r.postId === postId);
+    }
+  }
+};
+
+// Initialize sample messaging data
+export const initializeMessagingData = (): void => {
+  // Sample conversations
+  const sampleConversations = [
+    {
+      id: 'conv1',
+      type: 'dm',
+      title: '',
+      participants: [
+        {
+          id: 'part1',
+          conversationId: 'conv1',
+          userId: 'user1',
+          isMuted: false,
+          lastReadAt: '2024-01-15T10:00:00Z',
+          joinedAt: '2024-01-10T10:00:00Z'
+        },
+        {
+          id: 'part2',
+          conversationId: 'conv1',
+          userId: 'current-user',
+          isMuted: false,
+          lastReadAt: '2024-01-15T14:30:00Z',
+          joinedAt: '2024-01-10T10:00:00Z'
+        }
+      ],
+      unreadCount: 0,
+      createdAt: '2024-01-10T10:00:00Z',
+      updatedAt: '2024-01-15T14:30:00Z'
+    }
+  ];
+
+  // Sample messages
+  const sampleMessages = [
+    {
+      id: 'msg1',
+      conversationId: 'conv1',
+      senderId: 'user1',
+      body: 'Hey! I saw your basketball drills resource. Really impressive work!',
+      createdAt: '2024-01-15T10:00:00Z',
+      updatedAt: '2024-01-15T10:00:00Z'
+    },
+    {
+      id: 'msg2',
+      conversationId: 'conv1',
+      senderId: 'current-user',
+      body: 'Thanks! I\'ve been working on those drills for years. Glad you found them helpful.',
+      createdAt: '2024-01-15T10:05:00Z',
+      updatedAt: '2024-01-15T10:05:00Z'
+    },
+    {
+      id: 'msg3',
+      conversationId: 'conv1',
+      senderId: 'user1',
+      body: 'Would love to collaborate on some content. Do you have any football drills?',
+      createdAt: '2024-01-15T14:30:00Z',
+      updatedAt: '2024-01-15T14:30:00Z'
+    }
+  ];
+
+  // Only initialize if data doesn't exist
+  if (!localStorage.getItem(STORAGE_KEYS.conversations)) {
+    localStorage.setItem(STORAGE_KEYS.conversations, JSON.stringify(sampleConversations));
+  }
+  if (!localStorage.getItem(STORAGE_KEYS.messages)) {
+    localStorage.setItem(STORAGE_KEYS.messages, JSON.stringify(sampleMessages));
+  }
+  if (!localStorage.getItem(STORAGE_KEYS.blocks)) {
+    localStorage.setItem(STORAGE_KEYS.blocks, JSON.stringify([]));
+  }
+
+  // Sample discussion boards
+  const sampleBoards: DiscussionBoard[] = [
+    {
+      id: 'board1',
+      title: 'Basketball Coaching Tips',
+      description: 'Share and discuss basketball coaching strategies, drills, and techniques',
+      category: 'Sport Specific',
+      sport: 'Basketball',
+      level: 'All Levels',
+      creatorId: 'user1',
+      isPinned: true,
+      isLocked: false,
+      postCount: 15,
+      createdAt: '2024-01-10T10:00:00Z',
+      updatedAt: '2024-01-15T14:30:00Z'
+    },
+    {
+      id: 'board2',
+      title: 'Youth Development',
+      description: 'Discuss coaching approaches for young athletes and character development',
+      category: 'Age Group',
+      level: 'Youth',
+      creatorId: 'user2',
+      isPinned: false,
+      isLocked: false,
+      postCount: 8,
+      createdAt: '2024-01-12T10:00:00Z',
+      updatedAt: '2024-01-14T16:20:00Z'
+    }
+  ];
+
+  // Sample discussion posts
+  const samplePosts: DiscussionPost[] = [
+    {
+      id: 'post1',
+      boardId: 'board1',
+      title: 'Best defensive drills for beginners?',
+      content: 'I\'m looking for some effective defensive drills that work well with beginner players. What are your go-to exercises?',
+      authorId: 'user1',
+      postType: 'question',
+      isPinned: false,
+      upvotes: 12,
+      downvotes: 1,
+      replyCount: 5,
+      createdAt: '2024-01-15T10:00:00Z',
+      updatedAt: '2024-01-15T14:30:00Z'
+    },
+    {
+      id: 'post2',
+      boardId: 'board1',
+      title: 'Zone Defense vs Man-to-Man',
+      content: 'Let\'s discuss the pros and cons of zone defense versus man-to-man coverage for different age groups.',
+      authorId: 'user2',
+      postType: 'discussion',
+      isPinned: true,
+      upvotes: 8,
+      downvotes: 0,
+      replyCount: 3,
+      createdAt: '2024-01-14T15:00:00Z',
+      updatedAt: '2024-01-15T12:00:00Z'
+    }
+  ];
+
+  // Sample discussion replies
+  const sampleReplies: DiscussionReply[] = [
+    {
+      id: 'reply1',
+      postId: 'post1',
+      content: 'I\'ve had great success with the shell drill. Start with 4-on-0, then progress to 4-on-4. Really helps players understand positioning.',
+      authorId: 'user2',
+      upvotes: 5,
+      downvotes: 0,
+      createdAt: '2024-01-15T11:00:00Z',
+      updatedAt: '2024-01-15T11:00:00Z'
+    },
+    {
+      id: 'reply2',
+      postId: 'post1',
+      content: 'Mirror drills are also excellent. Have players mirror their partner\'s movements without a ball first.',
+      authorId: 'user3',
+      upvotes: 3,
+      downvotes: 0,
+      createdAt: '2024-01-15T12:30:00Z',
+      updatedAt: '2024-01-15T12:30:00Z'
+    }
+  ];
+
+  // Initialize discussion data if it doesn't exist
+  if (!localStorage.getItem(STORAGE_KEYS.discussionBoards)) {
+    localStorage.setItem(STORAGE_KEYS.discussionBoards, JSON.stringify(sampleBoards));
+  }
+  if (!localStorage.getItem(STORAGE_KEYS.discussionPosts)) {
+    localStorage.setItem(STORAGE_KEYS.discussionPosts, JSON.stringify(samplePosts));
+  }
+  if (!localStorage.getItem(STORAGE_KEYS.discussionReplies)) {
+    localStorage.setItem(STORAGE_KEYS.discussionReplies, JSON.stringify(sampleReplies));
+  }
+};
+
+// Realtime subscriptions
+export const subscribeToConversation = (conversationId: string, onMessage: (message: Message) => void) => {
+  if (!supabase) return null;
+
+  const channel = supabase
+    .channel(`conversation:${conversationId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'messages',
+        filter: `conversation_id=eq.${conversationId}`
+      },
+      (payload) => {
+        const message: Message = {
+          id: payload.new.id,
+          conversationId: payload.new.conversation_id,
+          senderId: payload.new.sender_id,
+          body: payload.new.body,
+          attachmentPath: payload.new.attachment_path,
+          attachmentType: payload.new.attachment_type,
+          createdAt: payload.new.created_at,
+          updatedAt: payload.new.updated_at
+        };
+        onMessage(message);
+      }
+    )
+    .subscribe();
+
+  return channel;
+};
+
+// Presence tracking
+export const subscribeToPresence = (conversationId: string, userId: string) => {
+  if (!supabase) return null;
+
+  const channel = supabase
+    .channel(`presence:${conversationId}`)
+    .on('presence', { event: 'sync' }, () => {
+      const state = channel.presenceState();
+      console.log('Presence state:', state);
+    })
+    .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+      console.log('User joined:', key, newPresences);
+    })
+    .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+      console.log('User left:', key, leftPresences);
+    })
+    .subscribe(async (status) => {
+      if (status === 'SUBSCRIBED') {
+        await channel.track({
+          user_id: userId,
+          online_at: new Date().toISOString()
+        });
+      }
+    });
+
+  return channel;
+};
+
+// Typing indicators
+export const sendTypingIndicator = (conversationId: string, userId: string, isTyping: boolean) => {
+  if (!supabase) return;
+
+  const channel = supabase.channel(`typing:${conversationId}`);
+  channel.send({
+    type: 'broadcast',
+    event: 'typing',
+    payload: { user_id: userId, is_typing: isTyping }
+  });
+};
+import { supabase } from './supabase';
+
+const API_BASE = import.meta.env.VITE_SITE_URL || 'http://localhost:4173';
+const ENABLE_PAID = import.meta.env.VITE_ENABLE_PAID === 'true';
+
+async function getAuthToken(): Promise<string | null> {
+  const { data: { session } } = await supabase.auth.getSession();
+  return session?.access_token || null;
+}
+
+async function apiCall(endpoint: string, options: RequestInit = {}): Promise<any> {
+  const token = await getAuthToken();
+
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+    ...options.headers,
+  };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${API_BASE}/api/v2${endpoint}`, {
+    ...options,
+    headers,
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.error || `HTTP ${response.status}`);
+  }
+
+  return data;
+}
+
+export const mvpApi = {
+  isPaidEnabled: () => ENABLE_PAID,
+
+  health: async () => {
+    return apiCall('/health');
+  },
+
+  createConnectLink: async () => {
+    return apiCall('/stripe/connect/link', { method: 'POST' });
+  },
+
+  createCheckoutSession: async (resourceId: string) => {
+    if (!ENABLE_PAID) {
+      throw new Error('Paid features are not enabled');
+    }
+    return apiCall('/checkout/session', {
+      method: 'POST',
+      body: JSON.stringify({ resourceId }),
+    });
+  },
+
+  purchaseFree: async (resourceId: string) => {
+    return apiCall('/purchase/free', {
+      method: 'POST',
+      body: JSON.stringify({ resourceId }),
+    });
+  },
+
+  getDownloadUrl: async (resourceId: string) => {
+    return apiCall('/download-url', {
+      method: 'POST',
+      body: JSON.stringify({ resourceId }),
+    });
+  },
+};
+
+export function isPaidFeatureEnabled(): boolean {
+  return ENABLE_PAID;
+}
+
+// Recommendation engine for Coach2Coach
+import { supabase } from './supabase';
+import { RecommendationResult } from './search/types';
+
+export interface CoPurchaseData {
+  resourceId: string;
+  coResourceId: string;
+  count: number;
+  recentWeight: number;
+}
+
+// Get "also bought" recommendations based on co-purchase data
+export async function getAlsoBoughtRecommendations(
+  resourceId: string,
+  limit: number = 12
+): Promise<RecommendationResult[]> {
+  try {
+    // Find users who bought this resource
+    const { data: buyers, error: buyersError } = await supabase
+      .from('purchases')
+      .select('buyer_id')
+      .eq('resource_id', resourceId)
+      .eq('status', 'succeeded');
+
+    if (buyersError || !buyers || buyers.length === 0) {
+      return getFallbackRecommendations(resourceId, limit);
+    }
+
+    const buyerIds = buyers.map(b => b.buyer_id);
+
+    // Find other resources these buyers purchased
+    const { data: coPurchases, error: coPurchasesError } = await supabase
+      .from('purchases')
+      .select(`
+        resource_id,
+        created_at,
+        resources!inner(
+          id,
+          title,
+          sports,
+          levels,
+          price,
+          rating,
+          purchase_count,
+          status,
+          is_listed
+        )
+      `)
+      .in('buyer_id', buyerIds)
+      .neq('resource_id', resourceId)
+      .eq('status', 'succeeded')
+      .eq('resources.status', 'active')
+      .eq('resources.is_listed', true);
+
+    if (coPurchasesError || !coPurchases) {
+      return getFallbackRecommendations(resourceId, limit);
+    }
+
+    // Count co-purchases and apply recency weighting
+    const coPurchaseCounts = new Map<string, { count: number; recentWeight: number; resource: any }>();
+    
+    coPurchases.forEach(purchase => {
+      const resourceId = purchase.resource_id;
+      const daysSincePurchase = Math.floor(
+        (new Date().getTime() - new Date(purchase.created_at).getTime()) / (1000 * 60 * 60 * 24)
+      );
+      
+      // Recent purchases get higher weight (decay over 30 days)
+      const recentWeight = Math.max(0.1, 1.0 - (daysSincePurchase / 30));
+      
+      if (coPurchaseCounts.has(resourceId)) {
+        const existing = coPurchaseCounts.get(resourceId)!;
+        existing.count += 1;
+        existing.recentWeight += recentWeight;
+      } else {
+        coPurchaseCounts.set(resourceId, {
+          count: 1,
+          recentWeight,
+          resource: purchase.resources
+        });
+      }
+    });
+
+    // Convert to recommendations and sort by score
+    const recommendations: RecommendationResult[] = Array.from(coPurchaseCounts.entries())
+      .map(([resourceId, data]) => ({
+        id: resourceId,
+        title: data.resource.title,
+        sport: data.resource.sports[0] || '',
+        level: data.resource.levels[0] || '',
+        price_cents: Math.round(data.resource.price * 100),
+        rating: data.resource.rating || 0,
+        purchase_count: data.resource.purchase_count || 0,
+        similarity_score: data.count * 1.0 + data.recentWeight * 0.25,
+        reason: 'co_purchase' as const
+      }))
+      .sort((a, b) => b.similarity_score - a.similarity_score)
+      .slice(0, limit);
+
+    // If we don't have enough co-purchase recommendations, fill with fallback
+    if (recommendations.length < limit) {
+      const fallbackRecs = await getFallbackRecommendations(resourceId, limit - recommendations.length);
+      recommendations.push(...fallbackRecs);
+    }
+
+    return recommendations;
+  } catch (error) {
+    console.error('Error getting also bought recommendations:', error);
+    return getFallbackRecommendations(resourceId, limit);
+  }
+}
+
+// Fallback recommendations based on content similarity
+export async function getFallbackRecommendations(
+  resourceId: string,
+  limit: number = 12
+): Promise<RecommendationResult[]> {
+  try {
+    // Get source resource details
+    const { data: sourceResource, error: sourceError } = await supabase
+      .from('resources')
+      .select('sports, levels, category, coach_id')
+      .eq('id', resourceId)
+      .single();
+
+    if (sourceError || !sourceResource) {
+      return [];
+    }
+
+    // Find similar resources by sport, level, and category
+    const { data: similarResources, error: similarError } = await supabase
+      .from('resources')
+      .select(`
+        id,
+        title,
+        sports,
+        levels,
+        category,
+        price,
+        rating,
+        purchase_count,
+        coach_id,
+        coach_profiles!inner(first_name, last_name)
+      `)
+      .eq('status', 'active')
+      .eq('is_listed', true)
+      .neq('id', resourceId)
+      .overlaps('sports', sourceResource.sports)
+      .order('purchase_count', { ascending: false })
+      .limit(limit * 2); // Get more to filter and rank
+
+    if (similarError || !similarResources) {
+      return [];
+    }
+
+    // Score recommendations based on similarity
+    const recommendations: RecommendationResult[] = similarResources
+      .map(resource => {
+        let similarityScore = 0;
+        let reason: RecommendationResult['reason'] = 'similar_content';
+
+        // Same coach bonus
+        if (resource.coach_id === sourceResource.coach_id) {
+          similarityScore += 2.0;
+          reason = 'same_coach';
+        }
+
+        // Sport overlap
+        const sportOverlap = resource.sports.filter(sport => 
+          sourceResource.sports.includes(sport)
+        ).length;
+        similarityScore += sportOverlap * 1.5;
+
+        // Level overlap
+        const levelOverlap = resource.levels.filter(level => 
+          sourceResource.levels.includes(level)
+        ).length;
+        similarityScore += levelOverlap * 1.0;
+
+        // Category match
+        if (resource.category === sourceResource.category) {
+          similarityScore += 1.0;
+        }
+
+        // Popularity boost
+        similarityScore += Math.log(1 + (resource.purchase_count || 0)) * 0.1;
+
+        return {
+          id: resource.id,
+          title: resource.title,
+          sport: resource.sports[0] || '',
+          level: resource.levels[0] || '',
+          price_cents: Math.round(resource.price * 100),
+          rating: resource.rating || 0,
+          purchase_count: resource.purchase_count || 0,
+          similarity_score: similarityScore,
+          reason
+        };
+      })
+      .sort((a, b) => b.similarity_score - a.similarity_score)
+      .slice(0, limit);
+
+    return recommendations;
+  } catch (error) {
+    console.error('Error getting fallback recommendations:', error);
+    return [];
+  }
+}
+
+// Get recommendations for a specific coach's other resources
+export async function getCoachOtherResources(
+  resourceId: string,
+  coachId: string,
+  limit: number = 6
+): Promise<RecommendationResult[]> {
+  try {
+    const { data: resources, error } = await supabase
+      .from('resources')
+      .select(`
+        id,
+        title,
+        sports,
+        levels,
+        price,
+        rating,
+        purchase_count
+      `)
+      .eq('coach_id', coachId)
+      .eq('status', 'active')
+      .eq('is_listed', true)
+      .neq('id', resourceId)
+      .order('purchase_count', { ascending: false })
+      .limit(limit);
+
+    if (error || !resources) {
+      return [];
+    }
+
+    return resources.map((resource, index) => ({
+      id: resource.id,
+      title: resource.title,
+      sport: resource.sports[0] || '',
+      level: resource.levels[0] || '',
+      price_cents: Math.round(resource.price * 100),
+      rating: resource.rating || 0,
+      purchase_count: resource.purchase_count || 0,
+      similarity_score: 1.0 - (index * 0.1),
+      reason: 'same_coach' as const
+    }));
+  } catch (error) {
+    console.error('Error getting coach other resources:', error);
+    return [];
+  }
+}
+
+// Refresh recommendations cache (call after purchases)
+export async function refreshRecommendationsForResource(resourceId: string): Promise<void> {
+  try {
+    // This would typically update a recommendations cache table
+    // For now, we'll just log that recommendations should be refreshed
+    console.log(`Recommendations refresh queued for resource: ${resourceId}`);
+    
+    // In a production system, you might:
+    // 1. Update a recommendations_cache table
+    // 2. Trigger a background job to recompute
+    // 3. Invalidate CDN cache for the resource page
+  } catch (error) {
+    console.error('Error refreshing recommendations:', error);
+  }
+}
+// Referral system utilities for Coach2Coach platform
+
+export interface ReferralData {
+  referrerUserId: string;
+  referredUserId: string;
+  status: 'DECLARED' | 'QUALIFIED' | 'REJECTED';
+  qualifiedAt?: string;
+}
+
+export interface ReferralProgress {
+  qualifiedCount: number;
+  discountActive: boolean;
+  discountExpiresAt?: string;
+  progressPercentage: number;
+  remainingReferrals: number;
+  discountTimeRemaining?: string;
+}
+
+// Calculate referral progress
+export function calculateReferralProgress(
+  qualifiedCount: number, 
+  discountActive: boolean, 
+  discountExpiresAt?: string
+): ReferralProgress {
+  const targetReferrals = 5;
+  const progressPercentage = Math.min((qualifiedCount / targetReferrals) * 100, 100);
+  const remainingReferrals = Math.max(targetReferrals - qualifiedCount, 0);
+
+  // Calculate time remaining for discount
+  let discountTimeRemaining: string | undefined;
+  if (discountActive && discountExpiresAt) {
+    const now = new Date();
+    const expiresAt = new Date(discountExpiresAt);
+    const diffInDays = Math.ceil((expiresAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    
+    if (diffInDays > 0) {
+      if (diffInDays > 30) {
+        const months = Math.floor(diffInDays / 30);
+        discountTimeRemaining = `${months} month${months !== 1 ? 's' : ''} remaining`;
+      } else {
+        discountTimeRemaining = `${diffInDays} day${diffInDays !== 1 ? 's' : ''} remaining`;
+      }
+    } else {
+      discountTimeRemaining = 'Expired';
+    }
+  }
+
+  return {
+    qualifiedCount,
+    discountActive,
+    discountExpiresAt,
+    progressPercentage,
+    remainingReferrals,
+    discountTimeRemaining
+  };
+}
+
+// Validate referrer (check if user exists and is not self)
+export async function validateReferrer(referrerIdentifier: string, newUserId: string): Promise<string | null> {
+  // This would typically query your user database
+  // For now, return null (no referrer found)
+  return null;
+}
+
+// Create referral relationship
+export async function createReferral(referrerUserId: string, referredUserId: string): Promise<boolean> {
+  try {
+    // In real implementation, this would create a database record
+    // For now, just return success
+    return true;
+  } catch (error) {
+    console.error('Error creating referral:', error);
+    return false;
+  }
+}
+
+// Get referral link for user
+export function generateReferralLink(userId: string, baseUrl: string): string {
+  return `${baseUrl}/signup?ref=${userId}`;
+}
+
+// Apply referral discount (called from server when 5 qualified referrals reached)
+export async function applyReferralDiscountIfEligible(referrerUserId: string): Promise<boolean> {
+  try {
+    // This would be implemented on the server side with Stripe API calls
+    // Server would create/apply the 10% forever coupon
+    console.log(`Applying referral discount for user: ${referrerUserId}`);
+    return true;
+  } catch (error) {
+    console.error('Error applying referral discount:', error);
+    return false;
+  }
+}
+// Automated content scanning utilities for Coach2Coach
+
+export interface ScanResult {
+  riskScore: number;
+  flags: string[];
+  details: {
+    copyrightPhrases?: string[];
+    suspiciousMetadata?: string[];
+    fileIssues?: string[];
+  };
+}
+
+export interface ScannerConfig {
+  copyrightPhrases: string[];
+  maxFileSizeMB: number;
+  autoApproveThreshold: number;
+  enableAutoApproval: boolean;
+}
+
+// Default scanner configuration
+export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
+  copyrightPhrases: [
+    'Pearson Education',
+    'McGraw-Hill',
+    'Houghton Mifflin',
+    'Holt McDougal',
+    'Oxford University Press',
+    'Cambridge University Press',
+    'Cengage Learning',
+    'Wiley',
+    'Prentice Hall',
+    'Scholastic',
+    'Teachers Pay Teachers',
+    'TpT',
+    'All rights reserved',
+    '© Copyright',
+    'Unauthorized reproduction'
+  ],
+  maxFileSizeMB: 500,
+  autoApproveThreshold: 10,
+  enableAutoApproval: true
+};
+
+// Extract text content from various file types
+export async function extractTextContent(filePath: string, mimeType: string): Promise<string> {
+  try {
+    if (mimeType.includes('pdf')) {
+      return await extractPdfText(filePath);
+    } else if (mimeType.includes('word') || mimeType.includes('document')) {
+      return await extractDocumentText(filePath);
+    } else if (mimeType.includes('presentation')) {
+      return await extractPresentationText(filePath);
+    } else {
+      return '';
+    }
+  } catch (error) {
+    console.error('Text extraction failed:', error);
+    return '';
+  }
+}
+
+// Extract text from PDF using pdftotext
+async function extractPdfText(filePath: string): Promise<string> {
+  const { spawn } = await import('child_process');
+  const { promisify } = await import('util');
+  const exec = promisify(spawn);
+
+  try {
+    const result = await exec('pdftotext', [filePath, '-']);
+    return result.stdout?.toString() || '';
+  } catch (error) {
+    console.error('PDF text extraction failed:', error);
+    return '';
+  }
+}
+
+// Extract text from Word/PowerPoint via LibreOffice conversion
+async function extractDocumentText(filePath: string): Promise<string> {
+  // Convert to PDF first, then extract text
+  const pdfPath = await convertToPdf(filePath);
+  return extractPdfText(pdfPath);
+}
+
+async function extractPresentationText(filePath: string): Promise<string> {
+  // Convert to PDF first, then extract text
+  const pdfPath = await convertToPdf(filePath);
+  return extractPdfText(pdfPath);
+}
+
+async function convertToPdf(filePath: string): Promise<string> {
+  const { spawn } = await import('child_process');
+  const path = await import('path');
+  const os = await import('os');
+
+  const outputDir = path.join(os.tmpdir(), `convert_${Date.now()}`);
+  const outputPath = path.join(outputDir, 'converted.pdf');
+
+  return new Promise((resolve, reject) => {
+    const libreOffice = spawn('libreoffice', [
+      '--headless',
+      '--convert-to', 'pdf',
+      '--outdir', outputDir,
+      filePath
+    ]);
+
+    libreOffice.on('close', (code) => {
+      if (code === 0) {
+        resolve(outputPath);
+      } else {
+        reject(new Error(`LibreOffice conversion failed with code ${code}`));
+      }
+    });
+  });
+}
+
+// Scan content for copyright violations and other issues
+export async function scanContent(
+  filePath: string, 
+  mimeType: string, 
+  fileName: string,
+  config: ScannerConfig = DEFAULT_SCANNER_CONFIG
+): Promise<ScanResult> {
+  const result: ScanResult = {
+    riskScore: 0,
+    flags: [],
+    details: {}
+  };
+
+  try {
+    // 1. File size check
+    const fs = await import('fs/promises');
+    const stats = await fs.stat(filePath);
+    const fileSizeMB = stats.size / (1024 * 1024);
+    
+    if (fileSizeMB > config.maxFileSizeMB) {
+      result.flags.push('oversized_file');
+      result.riskScore += 20;
+      result.details.fileIssues = [`File size ${fileSizeMB.toFixed(1)}MB exceeds limit`];
+    }
+
+    // 2. File name analysis
+    const suspiciousNamePatterns = [
+      /test|sample|demo|trial/i,
+      /\.(exe|bat|sh|cmd)$/i,
+      /copyright|©|all.?rights.?reserved/i
+    ];
+
+    suspiciousNamePatterns.forEach(pattern => {
+      if (pattern.test(fileName)) {
+        result.flags.push('suspicious_filename');
+        result.riskScore += 15;
+      }
+    });
+
+    // 3. Content text analysis
+    const textContent = await extractTextContent(filePath, mimeType);
+    
+    if (textContent) {
+      // Copyright phrase detection
+      const foundPhrases: string[] = [];
+      config.copyrightPhrases.forEach(phrase => {
+        if (textContent.toLowerCase().includes(phrase.toLowerCase())) {
+          foundPhrases.push(phrase);
+          result.riskScore += 25;
+        }
+      });
+
+      if (foundPhrases.length > 0) {
+        result.flags.push('copyright_phrases');
+        result.details.copyrightPhrases = foundPhrases;
+      }
+
+      // Publisher/textbook detection
+      const publisherPatterns = [
+        /isbn\s*:?\s*\d{10,13}/i,
+        /published\s+by\s+[a-z\s]+press/i,
+        /all\s+rights\s+reserved/i,
+        /unauthorized\s+reproduction/i
+      ];
+
+      publisherPatterns.forEach(pattern => {
+        if (pattern.test(textContent)) {
+          result.flags.push('publisher_content');
+          result.riskScore += 30;
+        }
+      });
+
+      // Educational material detection
+      const educationalPatterns = [
+        /chapter\s+\d+\s*:/i,
+        /homework|assignment|test\s+\d+/i,
+        /answer\s+key|solutions\s+manual/i
+      ];
+
+      educationalPatterns.forEach(pattern => {
+        if (pattern.test(textContent)) {
+          result.flags.push('educational_material');
+          result.riskScore += 20;
+        }
+      });
+    }
+
+    // 4. Metadata analysis (for PDFs)
+    if (mimeType.includes('pdf')) {
+      try {
+        const metadata = await extractPdfMetadata(filePath);
+        
+        // Check for suspicious creators/producers
+        const suspiciousCreators = [
+          'Adobe Acrobat',
+          'Microsoft Office',
+          'Google Docs',
+          'Canva',
+          'Teachers Pay Teachers'
+        ];
+
+        suspiciousCreators.forEach(creator => {
+          if (metadata.creator?.includes(creator) || metadata.producer?.includes(creator)) {
+            result.flags.push('suspicious_metadata');
+            result.riskScore += 10;
+            result.details.suspiciousMetadata = result.details.suspiciousMetadata || [];
+            result.details.suspiciousMetadata.push(`Creator: ${creator}`);
+          }
+        });
+      } catch (error) {
+        // Metadata extraction failed, not critical
+      }
+    }
+
+    // 5. Final risk assessment
+    if (result.riskScore >= 75) {
+      result.flags.push('high_risk');
+    } else if (result.riskScore >= 50) {
+      result.flags.push('medium_risk');
+    } else if (result.riskScore >= 25) {
+      result.flags.push('low_risk');
+    }
+
+  } catch (error) {
+    console.error('Content scanning failed:', error);
+    result.flags.push('scan_failed');
+    result.riskScore += 50; // High risk if we can't scan
+  }
+
+  return result;
+}
+
+// Extract PDF metadata
+async function extractPdfMetadata(filePath: string): Promise<any> {
+  const { spawn } = await import('child_process');
+  
+  return new Promise((resolve, reject) => {
+    const pdfinfo = spawn('pdfinfo', [filePath]);
+    let output = '';
+    
+    pdfinfo.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    pdfinfo.on('close', (code) => {
+      if (code === 0) {
+        const metadata: any = {};
+        output.split('\n').forEach(line => {
+          const [key, ...valueParts] = line.split(':');
+          if (key && valueParts.length > 0) {
+            metadata[key.trim().toLowerCase()] = valueParts.join(':').trim();
+          }
+        });
+        resolve(metadata);
+      } else {
+        reject(new Error(`pdfinfo failed with code ${code}`));
+      }
+    });
+  });
+}
+
+// Get scanner configuration from environment
+export function getScannerConfig(): ScannerConfig {
+  return {
+    copyrightPhrases: process.env.SCANNER_COPYRIGHT_PHRASES?.split(';') || DEFAULT_SCANNER_CONFIG.copyrightPhrases,
+    maxFileSizeMB: parseInt(process.env.SCANNER_MAX_FILE_MB || '500'),
+    autoApproveThreshold: parseInt(process.env.AUTO_APPROVE_THRESHOLD || '10'),
+    enableAutoApproval: process.env.AUTO_APPROVE_SAFE_UPLOADS === 'true'
+  };
+}
+// SEO utilities for Coach2Coach platform
+import { Metadata } from 'next';
+
+export interface SEOConfig {
+  title: string;
+  description: string;
+  canonical?: string;
+  image?: string;
+  type?: 'website' | 'article' | 'product';
+  publishedTime?: string;
+  modifiedTime?: string;
+  author?: string;
+  keywords?: string[];
+  noindex?: boolean;
+}
+
+// Build Next.js metadata object
+export function buildMetadata(config: SEOConfig): Metadata {
+  const {
+    title,
+    description,
+    canonical,
+    image,
+    type = 'website',
+    publishedTime,
+    modifiedTime,
+    author,
+    keywords,
+    noindex = false
+  } = config;
+
+  const fullTitle = title.includes('Coach2Coach') ? title : `${title} | Coach2Coach`;
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://coach2coachnetwork.com';
+  const fullCanonical = canonical ? `${baseUrl}${canonical}` : undefined;
+  const fullImage = image ? (image.startsWith('http') ? image : `${baseUrl}${image}`) : `${baseUrl}/og-default.png`;
+
+  return {
+    title: fullTitle,
+    description,
+    keywords: keywords?.join(', '),
+    robots: noindex ? 'noindex,nofollow' : 'index,follow',
+    canonical: fullCanonical,
+    openGraph: {
+      title: fullTitle,
+      description,
+      url: fullCanonical,
+      siteName: 'Coach2Coach',
+      images: [
+        {
+          url: fullImage,
+          width: 1200,
+          height: 630,
+          alt: title
+        }
+      ],
+      type,
+      publishedTime,
+      modifiedTime,
+      authors: author ? [author] : undefined
+    },
+    twitter: {
+      card: 'summary_large_image',
+      title: fullTitle,
+      description,
+      images: [fullImage],
+      creator: '@Coach2CoachNet'
+    },
+    alternates: {
+      canonical: fullCanonical
+    }
+  };
+}
+
+// Generate JSON-LD structured data
+export function generateProductSchema(resource: {
+  id: string;
+  title: string;
+  description: string;
+  price: number;
+  rating?: number;
+  reviewCount?: number;
+  image?: string;
+  coach: {
+    name: string;
+    title: string;
+  };
+}): object {
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://coach2coachnetwork.com';
+  
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'Product',
+    name: resource.title,
+    description: resource.description,
+    image: resource.image || `${baseUrl}/og-default.png`,
+    brand: {
+      '@type': 'Brand',
+      name: 'Coach2Coach'
+    },
+    offers: {
+      '@type': 'Offer',
+      price: resource.price.toString(),
+      priceCurrency: 'USD',
+      availability: 'https://schema.org/InStock',
+      seller: {
+        '@type': 'Person',
+        name: resource.coach.name,
+        jobTitle: resource.coach.title
+      }
+    },
+    aggregateRating: resource.rating && resource.reviewCount ? {
+      '@type': 'AggregateRating',
+      ratingValue: resource.rating.toString(),
+      reviewCount: resource.reviewCount.toString(),
+      bestRating: '5',
+      worstRating: '1'
+    } : undefined,
+    category: 'Coaching Resources',
+    audience: {
+      '@type': 'Audience',
+      audienceType: 'Coaches'
+    }
+  };
+}
+
+// Generate Article schema for spotlights/stories
+export function generateArticleSchema(article: {
+  title: string;
+  description: string;
+  content: string;
+  publishedAt: string;
+  modifiedAt?: string;
+  author: {
+    name: string;
+    title: string;
+  };
+  image?: string;
+}): object {
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://coach2coachnetwork.com';
+  
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'Article',
+    headline: article.title,
+    description: article.description,
+    articleBody: article.content,
+    datePublished: article.publishedAt,
+    dateModified: article.modifiedAt || article.publishedAt,
+    author: {
+      '@type': 'Person',
+      name: article.author.name,
+      jobTitle: article.author.title
+    },
+    publisher: {
+      '@type': 'Organization',
+      name: 'Coach2Coach',
+      logo: {
+        '@type': 'ImageObject',
+        url: `${baseUrl}/logo.png`
+      }
+    },
+    image: article.image || `${baseUrl}/og-default.png`,
+    mainEntityOfPage: {
+      '@type': 'WebPage',
+      '@id': baseUrl
+    }
+  };
+}
+
+// Generate BreadcrumbList schema
+export function generateBreadcrumbSchema(breadcrumbs: Array<{ name: string; url: string }>): object {
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://coach2coachnetwork.com';
+  
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
+    itemListElement: breadcrumbs.map((crumb, index) => ({
+      '@type': 'ListItem',
+      position: index + 1,
+      name: crumb.name,
+      item: `${baseUrl}${crumb.url}`
+    }))
+  };
+}
+
+// Generate Organization schema
+export function generateOrganizationSchema(): object {
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://coach2coachnetwork.com';
+  
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'Organization',
+    name: 'Coach2Coach',
+    alternateName: 'Coach2Coach Network',
+    description: 'The premier digital marketplace where coaching expertise meets opportunity.',
+    url: baseUrl,
+    logo: `${baseUrl}/logo.png`,
+    sameAs: [
+      'https://twitter.com/Coach2CoachNet',
+      'https://facebook.com/Coach2CoachNetwork',
+      'https://linkedin.com/company/coach2coach-network'
+    ],
+    contactPoint: {
+      '@type': 'ContactPoint',
+      telephone: '+1-678-343-5084',
+      contactType: 'customer service',
+      email: 'zach@coach2coachnetwork.com'
+    },
+    address: {
+      '@type': 'PostalAddress',
+      addressLocality: 'Atlanta',
+      addressRegion: 'GA',
+      addressCountry: 'US'
+    }
+  };
+}
+
+// SEO utilities for dynamic pages
+export class SEOManager {
+  private static instance: SEOManager;
+  private cache: Map<string, any> = new Map();
+
+  static getInstance(): SEOManager {
+    if (!SEOManager.instance) {
+      SEOManager.instance = new SEOManager();
+    }
+    return SEOManager.instance;
+  }
+
+  async getPageSEO(path: string): Promise<SEOConfig | null> {
+    try {
+      // Check cache first
+      if (this.cache.has(path)) {
+        return this.cache.get(path);
+      }
+
+      // Fetch from database
+      if (supabase) {
+        const { data, error } = await supabase
+          .from('seo_pages')
+          .select('*')
+          .eq('path', path)
+          .single();
+
+        if (!error && data) {
+          const seoConfig: SEOConfig = {
+            title: data.title,
+            description: data.description,
+            canonical: data.canonical_url || path,
+            keywords: data.keywords || [],
+            noindex: data.robots?.includes('noindex') || false
+          };
+          
+          this.cache.set(path, seoConfig);
+          return seoConfig;
+        }
+      }
+
+      return null;
+    } catch (error) {
+      console.error('Error fetching page SEO:', error);
+      return null;
+    }
+  }
+
+  async updatePageSEO(path: string, config: Partial<SEOConfig>): Promise<void> {
+    try {
+      if (supabase) {
+        await supabase
+          .from('seo_pages')
+          .upsert({
+            path,
+            title: config.title,
+            description: config.description,
+            keywords: config.keywords || [],
+            canonical_url: config.canonical,
+            robots: config.noindex ? 'noindex,nofollow' : 'index,follow',
+            last_modified: new Date().toISOString()
+          });
+      }
+
+      // Update cache
+      this.cache.set(path, config);
+    } catch (error) {
+      console.error('Error updating page SEO:', error);
+    }
+  }
+
+  generateSitemap(pages: Array<{ path: string; lastModified?: string; priority?: number; changeFreq?: string }>): string {
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://coach2coachnetwork.com';
+    
+    const urls = pages.map(page => `
+  <url>
+    <loc>${baseUrl}${page.path}</loc>
+    <lastmod>${page.lastModified || new Date().toISOString()}</lastmod>
+    <changefreq>${page.changeFreq || 'weekly'}</changefreq>
+    <priority>${page.priority || 0.5}</priority>
+  </url>`).join('');
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls}
+</urlset>`;
+  }
+}
+
+export const seoManager = SEOManager.getInstance();
+import { loadStripe } from '@stripe/stripe-js';
+
+// Initialize Stripe
+const stripePromise = loadStripe(import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY || '');
+
+export { stripePromise };
+
+// Stripe configuration
+export const stripeConfig = {
+  publishableKey: import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY || '',
+  currency: 'usd',
+  country: 'US'
+};
+
+// Commission rates based on membership tier
+export const commissionRates = {
+  member: 0.15,    // 15% platform fee, creators keep 85%
+};
+
+// Calculate commission breakdown
+export const calculateCommission = (price: number, tier: 'member' = 'member') => {
+  const rate = commissionRates.member;
+  const platformFee = price * rate;
+  const coachEarnings = price - platformFee;
+  
+  return {
+    totalPrice: price,
+    platformFee: Number(platformFee.toFixed(2)),
+    coachEarnings: Number(coachEarnings.toFixed(2)),
+    commissionRate: rate
+  };
+};
+
+// Create checkout session
+export const createCheckoutSession = async (resourceId: string, price: number, title: string) => {
+  try {
+    const response = await fetch('/api/create-checkout-session', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        resourceId,
+        price,
+        title,
+        currency: stripeConfig.currency
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to create checkout session');
+    }
+
+    const session = await response.json();
+    return session;
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    throw error;
+  }
+};
+
+// Redirect to Stripe Checkout
+export const redirectToCheckout = async (sessionId: string) => {
+  const stripe = await stripePromise;
+  
+  if (!stripe) {
+    throw new Error('Stripe failed to initialize');
+  }
+
+  const { error } = await stripe.redirectToCheckout({
+    sessionId: sessionId,
+  });
+
+  if (error) {
+    console.error('Error redirecting to checkout:', error);
+    throw error;
+  }
+};
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl =
+  (typeof process !== 'undefined' && process.env?.SUPABASE_URL) ||
+  import.meta.env?.VITE_SUPABASE_URL;
+
+const supabaseAnon =
+  (typeof process !== 'undefined' && process.env?.SUPABASE_ANON_KEY) ||
+  import.meta.env?.VITE_SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnon) {
+  console.error('Supabase env check:', {
+    supabaseUrl,
+    hasAnon: !!supabaseAnon,
+    env: import.meta.env
+  });
+  throw new Error('Missing Supabase environment variables');
+}
+
+console.log('Initializing Supabase with URL:', supabaseUrl);
+
+export const supabase = createClient(supabaseUrl as string, supabaseAnon as string, {
+  auth: {
+    autoRefreshToken: true,
+    persistSession: true,
+    detectSessionInUrl: false
+  }
+});
+
+export const db = {
+  getCoachProfile: async (userId: string) => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    return { data, error };
+  },
+
+  createCoachProfile: async (profileData: any) => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .insert([{
+        user_id: profileData.user_id,
+        first_name: profileData.first_name,
+        last_name: profileData.last_name,
+        email: profileData.email,
+        title: profileData.title || '',
+        bio: profileData.bio || '',
+        location: profileData.location || '',
+        years_experience: profileData.years_experience,
+        sports: profileData.sports || [],
+        levels: profileData.levels || [],
+        specialties: profileData.specialties || [],
+        achievements: profileData.achievements || [],
+        website: profileData.website,
+        social_links: profileData.social_links || {},
+        is_creator_enabled: true,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }])
+      .select()
+      .maybeSingle();
+
+    return { data, error };
+  },
+
+  updateCoachProfile: async (userId: string, updates: any) => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({
+        ...updates,
+        updated_at: new Date().toISOString()
+      })
+      .eq('user_id', userId)
+      .select()
+      .maybeSingle();
+
+    return { data, error };
+  }
+};
+
+export function getSupabaseAdmin() {
+  const url = process.env.SUPABASE_URL!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+  return createClient(url, key, { auth: { persistSession: false } });
+}
+
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error('Missing Supabase environment variables. Please check your .env file.');
+}
+
+export const supabaseClient = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    autoRefreshToken: true,
+    persistSession: true,
+    detectSessionInUrl: true
+  }
+});
+
+// Trending algorithm utilities for Coach2Coach
+import { supabase } from './supabase';
+
+export interface TrendingScore {
+  resourceId: string;
+  score: number;
+  purchases: number;
+  views: number;
+  ageDays: number;
+}
+
+// Compute trending score for a single resource
+export function computeTrendingScore(
+  purchases: number,
+  views: number,
+  uploadedAt: string
+): number {
+  // Raw engagement score: purchases worth 3x views
+  const rawScore = purchases * 3.0 + views * 0.5;
+  
+  // Age decay: newer content gets boost
+  const now = new Date();
+  const uploaded = new Date(uploadedAt);
+  const ageDays = Math.max(1, Math.floor((now.getTime() - uploaded.getTime()) / (1000 * 60 * 60 * 24)));
+  
+  // Decay factor: divide by (1 + age_days/7)
+  const decayFactor = 1.0 + (ageDays / 7.0);
+  
+  return rawScore / decayFactor;
+}
+
+// Compute trending scores for all resources
+export async function computeAllTrendingScores(): Promise<TrendingScore[]> {
+  try {
+    const { data: resources, error } = await supabase
+      .from('resources')
+      .select('id, purchase_count, view_count, uploaded_at, created_at')
+      .eq('status', 'active')
+      .eq('is_listed', true);
+
+    if (error) throw error;
+
+    const scores: TrendingScore[] = (resources || []).map(resource => {
+      const uploadedAt = resource.uploaded_at || resource.created_at;
+      const score = computeTrendingScore(
+        resource.purchase_count || 0,
+        resource.view_count || 0,
+        uploadedAt
+      );
+
+      return {
+        resourceId: resource.id,
+        score,
+        purchases: resource.purchase_count || 0,
+        views: resource.view_count || 0,
+        ageDays: Math.floor((new Date().getTime() - new Date(uploadedAt).getTime()) / (1000 * 60 * 60 * 24))
+      };
+    });
+
+    // Sort by score descending
+    scores.sort((a, b) => b.score - a.score);
+
+    return scores;
+  } catch (error) {
+    console.error('Error computing trending scores:', error);
+    return [];
+  }
+}
+
+// Refresh the trending cache in database
+export async function refreshTrendingCache(): Promise<void> {
+  try {
+    const { error } = await supabase.rpc('refresh_trending_cache');
+    if (error) throw error;
+    
+    console.log('Trending cache refreshed successfully');
+  } catch (error) {
+    console.error('Error refreshing trending cache:', error);
+    throw error;
+  }
+}
+
+// Get trending resources from cache
+export async function getTrendingFromCache(limit: number = 12): Promise<any[]> {
+  try {
+    const { data, error } = await supabase
+      .from('trending_cache')
+      .select(`
+        resource_id,
+        trending_score,
+        rank_position,
+        resources!inner(
+          title,
+          sports,
+          price,
+          rating,
+          coach_profiles!inner(first_name, last_name)
+        )
+      `)
+      .order('rank_position', { ascending: true })
+      .limit(limit);
+
+    if (error) throw error;
+
+    return (data || []).map(item => ({
+      id: item.resource_id,
+      title: item.resources.title,
+      sport: item.resources.sports[0] || '',
+      price_cents: Math.round(item.resources.price * 100),
+      trending_score: item.trending_score,
+      rank_position: item.rank_position,
+      rating: item.resources.rating || 0,
+      coach_name: `${item.resources.coach_profiles.first_name} ${item.resources.coach_profiles.last_name}`
+    }));
+  } catch (error) {
+    console.error('Error getting trending from cache:', error);
+    return [];
+  }
+}
+
+// Schedule trending cache refresh (call this from a cron job)
+export async function scheduleTrendingRefresh(): Promise<void> {
+  try {
+    await refreshTrendingCache();
+    console.log('Scheduled trending refresh completed');
+  } catch (error) {
+    console.error('Scheduled trending refresh failed:', error);
+  }
+}
+import { supabase } from './supabase';
+
+export interface UserRole {
+  isLoggedIn: boolean;
+  isCoach: boolean;
+  userId: string | null;
+}
+
+export async function getUserRole(userId: string | null): Promise<UserRole> {
+  if (!userId) {
+    return { isLoggedIn: false, isCoach: false, userId: null };
+  }
+
+  try {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('is_creator_enabled')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    const isCoach = profile?.is_creator_enabled === true;
+
+    return { isLoggedIn: true, isCoach, userId };
+  } catch (error) {
+    console.error('Error fetching user role:', error);
+    return { isLoggedIn: true, isCoach: false, userId };
+  }
+}
+
+export function getAudienceContent(isCoach: boolean) {
+  return {
+    hero: {
+      subtitle: isCoach
+        ? 'Sell your drills & playbooks. Keep 85%.'
+        : 'Coach2Coach',
+      title: isCoach
+        ? 'Created by coaches, for coaches — practice-ready PDFs, plans, and drills.'
+        : 'Join the ELITE coaching network',
+      description: 'Ready-to-use coaching resources created by proven coaches.',
+      searchPlaceholder: 'Search drills, playbooks, practice plans…',
+    },
+    ctas: isCoach
+      ? { primary: 'Upload Resource', primaryLink: '/upload', secondary: 'My Library', secondaryLink: '/account' }
+      : { primary: 'Browse Resources', primaryLink: '/browse', secondary: 'Become a Seller', secondaryLink: '/become-seller' },
+  };
+}
