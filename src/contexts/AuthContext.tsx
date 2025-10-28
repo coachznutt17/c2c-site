@@ -3,7 +3,7 @@ import {
   sessionStorage,
   User,
   initializeSampleData,
-} from '../lib/localStorage';
+} from '../utils/localStorage';
 import { supabase } from '../lib/supabase';
 import { initializeMessagingData } from '../lib/messaging';
 
