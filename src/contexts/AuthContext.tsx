@@ -5,7 +5,6 @@ import {
   initializeSampleData,
 } from '../utils/localStorage';
 import { supabase } from '../supabase';
-import { initializeMessagingData } from '../lib/messaging';
 
 interface AuthContextType {
   user: User | null;
@@ -35,7 +34,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   useEffect(() => {
     initializeSampleData();
-    initializeMessagingData();
 
     const initializeAuth = async () => {
       try {
