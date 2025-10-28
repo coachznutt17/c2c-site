@@ -46,11 +46,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           };
           setUser(localUser);
         } else {
-          const currentUser = sessionStorage.getCurrentUser();
+          const currentUser = null;
           setUser(currentUser);
         }
       } catch {
-        const currentUser = sessionStorage.getCurrentUser();
+        const currentUser = null;
         setUser(currentUser);
       } finally {
         setLoading(false);
@@ -135,7 +135,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             createdAt: data.user.created_at || new Date().toISOString(),
           };
           setUser(newUser);
-          sessionStorage.setCurrentUser(newUser);
           console.log('[Signup Complete] User signed up successfully:', newUser);
         }
 
@@ -216,7 +215,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           createdAt: data.user.created_at || new Date().toISOString(),
         };
         setUser(localUser);
-        sessionStorage.setCurrentUser(localUser);
         console.log('User signed in successfully:', localUser);
       }
 
@@ -231,7 +229,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const signOut = async () => {
     try {
       await supabase.auth.signOut();
-      sessionStorage.clearSession();
       setUser(null);
       return { error: null };
     } catch (e: any) {
