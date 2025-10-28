@@ -4,7 +4,7 @@ import {
   User,
   initializeSampleData,
 } from '../utils/localStorage';
-import { supabase } from '../lib/supabase';
+import { supabase } from '../supabase';
 import { initializeMessagingData } from '../lib/messaging';
 
 interface AuthContextType {
