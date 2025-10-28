@@ -1,8 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import {
   sessionStorage,
-  User,
-  initializeSampleData,
+  User
 } from '../utils/localStorage';
 import { supabase } from '../supabase';
 
@@ -33,7 +32,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    initializeSampleData();
 
     const initializeAuth = async () => {
       try {
