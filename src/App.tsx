@@ -13,6 +13,8 @@ import FeaturedCoaches from './components/FeaturedCoaches';
 import FeaturedResources from './components/FeaturedResources';
 import BrowseResources from './components/BrowseResources';
 import Footer from './components/Footer';
+import SignIn from './routes/SignIn';
+
 
 // (Auth-related components REMOVED here to satisfy Vercel for now)
 // import UserSignupForm from './components/UserSignupForm';
@@ -45,6 +47,7 @@ function App() {
             <Routes>
               <Route path="/" element={<HomePage />} />
               <Route path="/browse" element={<BrowseResources />} />
+              <Route path="/signin" element={<SignIn />} />
 
               {/*
                 TEMPORARILY DISABLED ROUTES FOR DEPLOY:
