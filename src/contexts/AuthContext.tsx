@@ -1,6 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import {
-  sessionStorage,
   User
 } from '../utils/localStorage';
 import { supabase } from '../supabase';
