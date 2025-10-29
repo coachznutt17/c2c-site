@@ -23,7 +23,7 @@ const Header: React.FC = () => {
         <a href="/upload" style={{ textDecoration: "none", color: "#0d1b2a" }}>
           Sell Content
         </a>
-        <a href="/login" style={{ textDecoration: "none", color: "#0d1b2a" }}>
+        <a href="/signin" style={{ textDecoration: "none", color: "#0d1b2a" }}>
           Sign In
         </a>
       </nav>
