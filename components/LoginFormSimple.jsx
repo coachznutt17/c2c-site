@@ -20,10 +20,23 @@ export default function LoginFormSimple() {
     setIsLoading(true);
 
     try {
-      const { data, error } = await supabaseClient.auth.signInWithPassword({
-        email,
-        password
-      });
+     const res = await fetch('https://coach2coach-api.onrender.com/api/auth/login', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email, password }),
+});
+
+if (!res.ok) {
+  const body = await res.json().catch(() => ({}));
+  throw new Error(body.error || 'Login failed');
+}
+
+const data = await res.json();
+console.log('LOGIN SUCCESS', data);
+
+toast.success('Welcome back!');
+navigate('/user-profile');
+
 
       if (error) {
         if (error.message.includes('Email not confirmed')) {
