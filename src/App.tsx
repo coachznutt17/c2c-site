@@ -48,7 +48,8 @@ function App() {
             <Routes>
               <Route path="/" element={<HomePage />} />
               <Route path="/browse" element={<BrowseResources />} />
-              <Route path="/signin" element={<SignIn />} />
+              <Route path="/login" element={<LoginFormSimple />} />
+
 
               {/*
                 TEMPORARILY DISABLED ROUTES FOR DEPLOY:
