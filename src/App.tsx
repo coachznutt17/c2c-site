@@ -8,13 +8,11 @@ export default function App() {
     <BrowserRouter>
       <Toaster position="top-center" />
       <Routes>
-        {/* send root to /login */}
         <Route path="/" element={<Navigate to="/login" replace />} />
-        {/* login page */}
         <Route path="/login" element={<LoginFormSimple />} />
-        {/* simple 404 fallback */}
-        <Route path="*" element={<div style={{padding:24}}>Not found</div>} />
+        <Route path="*" element={<div style={{ padding: 24 }}>Not found</div>} />
       </Routes>
     </BrowserRouter>
   );
 }
+
