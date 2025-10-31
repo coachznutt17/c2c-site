@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { supabaseClient } from '../lib/supabaseClient';
 
 export default function LoginFormSimple() {
   const navigate = useNavigate();
@@ -20,7 +19,7 @@ export default function LoginFormSimple() {
     setIsLoading(true);
 
     try {
-     const res = await fetch('https://coach2coach-api.onrender.com/api/auth/login', {
+     const res = await fetch('https://coach2coach-api-1.onrender.com/api/auth/login', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ email, password }),
@@ -33,25 +32,14 @@ if (!res.ok) {
 
 const data = await res.json();
 console.log('LOGIN SUCCESS', data);
+      
+if (data?.session?.access_token) {
+  localStorage.setItem('c2c_token', data.session.access_token);
+}
+localStorage.setItem('c2c_user', JSON.stringify(data.user || null));
 
 toast.success('Welcome back!');
 navigate('/user-profile');
-
-
-      if (error) {
-        if (error.message.includes('Email not confirmed')) {
-          toast.error('Please verify your email before logging in. Check your inbox.');
-        } else if (error.message.includes('Invalid login credentials')) {
-          toast.error('Invalid email or password');
-        } else {
-          toast.error(error.message);
-        }
-        setIsLoading(false);
-        return;
-      }
-
-      toast.success('Welcome back!');
-      navigate('/user-profile');
 
     } catch (error) {
       console.error('Login error:', error);
