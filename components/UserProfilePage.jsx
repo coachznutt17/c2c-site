@@ -90,10 +90,13 @@ export default function UserProfilePage() {
   };
 
   const handleSubmit = async (e) => {
-    e.preventDefault();
-    setSaving(true);
+  e.preventDefault();
+  console.log('🔔 handleSubmit fired', { formData, user });  // <-- add this line
+  setSaving(true);
 
-    try {
+  try {
+    // ...
+
       let avatarUrl = profile?.avatar_url || '';
 
       if (formData.profilePicture) {
