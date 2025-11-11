@@ -1,10 +1,7 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import LoginFormSimple from './components/LoginFormSimple';
-
-function UserProfile() {
-  return <div style={{ padding: 24 }}>User Profile (placeholder)</div>;
-}
+import UserProfilePage from './components/UserProfilePage';
 
 export default function App() {
   return (
@@ -12,7 +9,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/login" replace />} />
         <Route path="/login" element={<LoginFormSimple />} />
-        <Route path="/user-profile" element={<UserProfile />} />
+        <Route path="/user-profile" element={<UserProfilePage />} />
         <Route path="*" element={<div style={{ padding: 24 }}>Not found</div>} />
       </Routes>
     </BrowserRouter>
