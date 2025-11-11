@@ -1,7 +1,7 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import LoginFormSimple from './components/LoginFormSimple';
-import UserProfilePage from './components/UserProfilePage';
+import LoginFormSimple from './components/LoginFormSimple.jsx';
+import UserProfilePage from './components/UserProfilePage.jsx';
 
 export default function App() {
   return (
