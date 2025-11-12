@@ -85,7 +85,23 @@ export default function UserProfilePage() {
       }
       row = inserted;
     }
-
+    setProfile(row);
+    setFormData({
+      first_name: row.first_name || '',
+      last_name: row.last_name || '',
+      email: row.email || authUser.email || '',
+      bio: row.bio || '',
+      location: row.location || '',
+      profilePicture: null,
+    });
+    if (row.avatar_url) setPreviewUrl(row.avatar_url);
+  } catch (error) {
+    console.error('Load profile error:', error);
+    toast.error('An error occurred loading your profile');
+  } finally {
+    setLoading(false);
+  }
+};
     // Fill React state for the form
     setProfile(row);
     setFormData({
