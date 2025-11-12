@@ -28,13 +28,83 @@ export default function UserProfilePage() {
   }, []);
 
   const loadProfile = async () => {
-    try {
-      const tok = localStorage.getItem(TOKEN_KEY);
-      if (!tok) {
-        console.warn('No c2c_token found, redirecting to login');
-        navigate('/login');
+  try {
+    const {
+      data: { user: authUser },
+      error: authError,
+    } = await supabaseClient.auth.getUser();
+
+    if (authError || !authUser) {
+      navigate('/login');
+      return;
+    }
+
+    setUser(authUser);
+    console.log('UserProfilePage: loading profile for user', authUser.id);
+
+    // Try to get a single profile row for this user
+    const { data: profileData, error: profileError } = await supabaseClient
+      .from('profiles')
+      .select('*')
+      .eq('user_id', authUser.id)
+      .maybeSingle();
+
+    if (profileError && profileError.code !== 'PGRST116') {
+      // Not the "no rows" case — real error
+      console.error('Profile load error:', profileError);
+      toast.error('Failed to load profile');
+      return;
+    }
+
+    let row = profileData;
+
+    // If nothing found, create a blank row for this user
+    if (!row) {
+      const seed = {
+        user_id: authUser.id,
+        first_name: '',
+        last_name: '',
+        email: authUser.email || '',
+        bio: '',
+        location: '',
+        avatar_url: '',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+
+      const { data: inserted, error: insertErr } = await supabaseClient
+        .from('profiles')
+        .insert(seed)
+        .select('*')
+        .single();
+
+      if (insertErr) {
+        console.error('Profile insert error:', insertErr);
+        toast.error('Could not create your profile row');
         return;
       }
+      row = inserted;
+    }
+
+    // Fill React state for the form
+    setProfile(row);
+    setFormData({
+      first_name: row.first_name || '',
+      last_name: row.last_name || '',
+      email: row.email || authUser.email || '',
+      bio: row.bio || '',
+      location: row.location || '',
+      profilePicture: null,
+    });
+    if (row.avatar_url) setPreviewUrl(row.avatar_url);
+  } catch (error) {
+    console.error('Load profile error:', error);
+    toast.error('An error occurred loading your profile');
+  } finally {
+    setLoading(false);
+  }
+};
+
 
       // Decode JWT locally to get user id (sub) and maybe email
       const payloadPart = tok.split('.')[1];
