@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { supabaseClient } from '../lib/supabaseClient';
+import { supabaseClient } from '../lib/supabase.ts';
 
 export default function UserProfilePage() {
   const navigate = useNavigate();
