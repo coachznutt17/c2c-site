@@ -1,9 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
-
-const API_BASE_URL = 'https://coach2coach-api-1.onrender.com';
-const TOKEN_KEY = 'c2c_token';
+import { supabaseClient } from '../lib/supabaseClient';
 
 export default function UserProfilePage() {
   const navigate = useNavigate();
@@ -18,9 +16,7 @@ export default function UserProfilePage() {
     email: '',
     bio: '',
     location: '',
-    profilePicture: null,
   });
-  const [previewUrl, setPreviewUrl] = useState('');
 
   useEffect(() => {
     loadProfile();
@@ -28,145 +24,74 @@ export default function UserProfilePage() {
   }, []);
 
   const loadProfile = async () => {
-  try {
-    const { data: { user: authUser }, error: authError } = await supabaseClient.auth.getUser();
+    try {
+      // 1) Who is logged in?
+      const {
+        data: { user: authUser },
+        error: authError,
+      } = await supabaseClient.auth.getUser();
 
-    if (authError || !authUser) {
-      navigate('/login');
-      return;
-    }
-
-    setUser(authUser);
-    console.log('UserProfilePage: loading profile for user', authUser.id);
-
-    // Try to get a single profile row for this user
-    const { data: profileData, error: profileError } = await supabaseClient
-      .from('profiles')
-      .select('*')
-      .eq('user_id', authUser.id)
-      .maybeSingle();
-
-    if (profileError && profileError.code !== 'PGRST116') {
-      console.error('Profile load error:', profileError);
-      toast.error('Failed to load profile');
-      return;
-    }
-
-    let row = profileData;
-
-    // If nothing found, create a blank row for this user
-    if (!row) {
-      const seed = {
-        user_id: authUser.id,
-        first_name: '',
-        last_name: '',
-        email: authUser.email || '',
-        bio: '',
-        location: '',
-        avatar_url: '',
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-
-      const { data: inserted, error: insertErr } = await supabaseClient
-        .from('profiles')
-        .insert(seed)
-        .select('*')
-        .single();
-
-      if (insertErr) {
-        console.error('Profile insert error:', insertErr);
-        toast.error('Could not create your profile row');
-        return;
-      }
-      row = inserted;
-    }
-
-    // Fill React state for the form
-    setProfile(row);
-    setFormData({
-      first_name: row.first_name || '',
-      last_name: row.last_name || '',
-      email: row.email || authUser.email || '',
-      bio: row.bio || '',
-      location: row.location || '',
-      profilePicture: null,
-    });
-    if (row.avatar_url) setPreviewUrl(row.avatar_url);
-  } catch (error) {
-    console.error('Load profile error:', error);
-    toast.error('An error occurred loading your profile');
-  } finally {
-    setLoading(false);
-  }
-};
-
-    // Fill React state for the form
-    setProfile(row);
-    setFormData({
-      first_name: row.first_name || '',
-      last_name: row.last_name || '',
-      email: row.email || authUser.email || '',
-      bio: row.bio || '',
-      location: row.location || '',
-      profilePicture: null,
-    });
-    if (row.avatar_url) setPreviewUrl(row.avatar_url);
-  } catch (error) {
-    console.error('Load profile error:', error);
-    toast.error('An error occurred loading your profile');
-  } finally {
-    setLoading(false);
-  }
-};
-
-
-      // Decode JWT locally to get user id (sub) and maybe email
-      const payloadPart = tok.split('.')[1];
-      const payloadJson = atob(payloadPart);
-      const payload = JSON.parse(payloadJson);
-      const uid = payload.sub;
-      setUserId(uid);
-
-      console.log('UserProfilePage: loading profile for user', uid);
-
-      const res = await fetch(`${API_BASE_URL}/api/profiles/me`, {
-        headers: { Authorization: `Bearer ${tok}` },
-      });
-
-      if (res.status === 401) {
-        console.warn('Unauthorized on /api/profiles/me, redirecting to login');
+      if (authError || !authUser) {
+        console.warn('No Supabase user; redirecting to login');
         navigate('/login');
         return;
       }
 
-      const json = await res.json();
-      console.log('API /api/profiles/me response:', json);
+      setUserId(authUser.id);
+      console.log('UserProfilePage: loading profile for user', authUser.id);
 
-      if (!json.ok) {
-        if (json.error === 'not_found') {
-          toast.error('Profile not found. Please contact support.');
-        } else {
-          toast.error('Failed to load profile');
-        }
+      // 2) Try to get this user's profile row
+      const { data: profileData, error: profileError } = await supabaseClient
+        .from('profiles')
+        .select('*')
+        .eq('user_id', authUser.id)
+        .maybeSingle();
+
+      if (profileError && profileError.code !== 'PGRST116') {
+        console.error('Profile load error:', profileError);
+        toast.error('Failed to load profile');
         return;
       }
 
-      const profileData = json.profile;
-      setProfile(profileData);
+      let row = profileData;
 
-      setFormData({
-        first_name: profileData.first_name || '',
-        last_name: profileData.last_name || '',
-        email: profileData.email || payload.email || '',
-        bio: profileData.bio || '',
-        location: profileData.location || '',
-        profilePicture: null,
-      });
+      // 3) If missing, create a blank row
+      if (!row) {
+        const seed = {
+          user_id: authUser.id,
+          first_name: '',
+          last_name: '',
+          email: authUser.email || '',
+          bio: '',
+          location: '',
+          avatar_url: '',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
 
-      if (profileData.avatar_url) {
-        setPreviewUrl(profileData.avatar_url);
+        const { data: inserted, error: insertErr } = await supabaseClient
+          .from('profiles')
+          .insert(seed)
+          .select('*')
+          .single();
+
+        if (insertErr) {
+          console.error('Profile insert error:', insertErr);
+          toast.error('Could not create your profile row');
+          return;
+        }
+        row = inserted;
       }
+
+      // 4) Fill form + state
+      setProfile(row);
+      setFormData({
+        first_name: row.first_name || '',
+        last_name: row.last_name || '',
+        email: row.email || authUser.email || '',
+        bio: row.bio || '',
+        location: row.location || '',
+      });
     } catch (error) {
       console.error('Load profile error:', error);
       toast.error('An error occurred loading your profile');
@@ -182,23 +107,36 @@ export default function UserProfilePage() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    console.log('🔔 handleSubmit fired', { formData, user });
-    setSaving(true);
+    console.log('🔔 handleSubmit fired', { formData, userId });
 
+    if (!userId) {
+      toast.error('You must be logged in.');
+      return;
+    }
+
+    setSaving(true);
     try {
-      if (!userId) {
-        toast.error('No user id found');
-        setSaving(false);
+      const updateData = {
+        first_name: formData.first_name,
+        last_name: formData.last_name,
+        bio: formData.bio,
+        location: formData.location,
+        updated_at: new Date().toISOString(),
+      };
+
+      const { error: updateError } = await supabaseClient
+        .from('profiles')
+        .update(updateData)
+        .eq('user_id', userId);
+
+      if (updateError) {
+        console.error('Update error:', updateError);
+        toast.error('Failed to update profile');
         return;
       }
 
-      // For now, just log instead of writing to DB, to keep it simple
-      console.log('Would save profile with data:', {
-        userId,
-        ...formData,
-      });
-
-      toast.success('Profile loaded successfully (save not wired yet)');
+      toast.success('Profile updated successfully!');
+      await loadProfile(); // refresh the UI
     } catch (error) {
       console.error('Save error:', error);
       toast.error('An unexpected error occurred');
@@ -209,8 +147,7 @@ export default function UserProfilePage() {
 
   const handleLogout = async () => {
     try {
-      // If you have supabase auth wired here you can sign out; otherwise just clear the token
-      localStorage.removeItem(TOKEN_KEY);
+      await supabaseClient.auth.signOut();
     } catch (err) {
       console.error('Logout error:', err);
     }
@@ -304,9 +241,7 @@ export default function UserProfilePage() {
                 placeholder="Tell us about yourself"
                 className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
               />
-              <p className="mt-1 text-xs text-gray-500">
-                {formData.bio.length}/500 characters
-              </p>
+              <p className="mt-1 text-xs text-gray-500">{formData.bio.length}/500 characters</p>
             </div>
 
             <div>
