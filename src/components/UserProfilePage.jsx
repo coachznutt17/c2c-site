@@ -29,10 +29,7 @@ export default function UserProfilePage() {
 
   const loadProfile = async () => {
   try {
-    const {
-      data: { user: authUser },
-      error: authError,
-    } = await supabaseClient.auth.getUser();
+    const { data: { user: authUser }, error: authError } = await supabaseClient.auth.getUser();
 
     if (authError || !authUser) {
       navigate('/login');
@@ -50,7 +47,6 @@ export default function UserProfilePage() {
       .maybeSingle();
 
     if (profileError && profileError.code !== 'PGRST116') {
-      // Not the "no rows" case — real error
       console.error('Profile load error:', profileError);
       toast.error('Failed to load profile');
       return;
@@ -85,6 +81,8 @@ export default function UserProfilePage() {
       }
       row = inserted;
     }
+
+    // Fill React state for the form
     setProfile(row);
     setFormData({
       first_name: row.first_name || '',
@@ -102,6 +100,7 @@ export default function UserProfilePage() {
     setLoading(false);
   }
 };
+
     // Fill React state for the form
     setProfile(row);
     setFormData({
