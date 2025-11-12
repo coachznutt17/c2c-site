@@ -97,6 +97,7 @@ export default function UserProfilePage() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    console.log('🔔 handleSubmit fired', { formData, user });
     setSaving(true);
 
     try {
