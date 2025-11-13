@@ -1,278 +1,311 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { supabaseClient } from '../lib/supabase.ts';
+
+const API_URL = import.meta.env.VITE_API_URL || 'https://coach2coach-api-1.onrender.com';
+
+// This must match your Supabase auth key in localStorage
+const SUPABASE_AUTH_KEY = 'sb-xkjidqfsenjrcabsagoi-auth-token';
+
+type CoachProfile = {
+  id?: string;
+  full_name: string;
+  sport: string;
+  coaching_level: string;
+  location: string;
+  years_experience: number | string;
+  bio: string;
+  twitter_handle: string;
+  instagram_handle: string;
+};
 
 export default function UserProfilePage() {
   const navigate = useNavigate();
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [userId, setUserId] = useState(null);
-  const [profile, setProfile] = useState(null);
-  const [formData, setFormData] = useState({
-    first_name: '',
-    last_name: '',
-    email: '',
-    bio: '',
+  const [profile, setProfile] = useState<CoachProfile>({
+    full_name: '',
+    sport: '',
+    coaching_level: '',
     location: '',
+    years_experience: '',
+    bio: '',
+    twitter_handle: '',
+    instagram_handle: '',
   });
 
-  useEffect(() => {
-    loadProfile();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const loadProfile = async () => {
+  // ================
+  // Helpers
+  // ================
+  function getAccessToken(): string | null {
     try {
-      // 1) Who is logged in?
-      const {
-        data: { user: authUser },
-        error: authError,
-      } = await supabaseClient.auth.getUser();
-
-      if (authError || !authUser) {
-        console.warn('No Supabase user; redirecting to login');
-        navigate('/login');
-        return;
+      const raw = localStorage.getItem(SUPABASE_AUTH_KEY);
+      if (!raw) {
+        console.warn('No Supabase auth token in localStorage');
+        return null;
       }
-
-      setUserId(authUser.id);
-      console.log('UserProfilePage: loading profile for user', authUser.id);
-
-      // 2) Try to get this user's profile row
-      const { data: profileData, error: profileError } = await supabaseClient
-        .from('profiles')
-        .select('*')
-        .eq('user_id', authUser.id)
-        .maybeSingle();
-
-      if (profileError && profileError.code !== 'PGRST116') {
-        console.error('Profile load error:', profileError);
-        toast.error('Failed to load profile');
-        return;
+      const parsed = JSON.parse(raw);
+      const token = parsed?.access_token;
+      if (!token) {
+        console.warn('Parsed Supabase auth token has no access_token field', parsed);
       }
-
-      let row = profileData;
-
-      // 3) If missing, create a blank row
-      if (!row) {
-        const seed = {
-          user_id: authUser.id,
-          first_name: '',
-          last_name: '',
-          email: authUser.email || '',
-          bio: '',
-          location: '',
-          avatar_url: '',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        };
-
-        const { data: inserted, error: insertErr } = await supabaseClient
-          .from('profiles')
-          .insert(seed)
-          .select('*')
-          .single();
-
-        if (insertErr) {
-          console.error('Profile insert error:', insertErr);
-          toast.error('Could not create your profile row');
-          return;
-        }
-        row = inserted;
-      }
-
-      // 4) Fill form + state
-      setProfile(row);
-      setFormData({
-        first_name: row.first_name || '',
-        last_name: row.last_name || '',
-        email: row.email || authUser.email || '',
-        bio: row.bio || '',
-        location: row.location || '',
-      });
-    } catch (error) {
-      console.error('Load profile error:', error);
-      toast.error('An error occurred loading your profile');
-    } finally {
-      setLoading(false);
+      return token || null;
+    } catch (err) {
+      console.error('Error reading Supabase auth token from localStorage:', err);
+      return null;
     }
-  };
+  }
 
-  const handleInputChange = (e) => {
-    const { name, value } = e.target;
-    setFormData((prev) => ({ ...prev, [name]: value }));
-  };
+  async function fetchProfile() {
+    console.log('UserProfilePage: fetching profile from API...');
+    setLoading(true);
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    console.log('🔔 handleSubmit fired', { formData, userId });
-
-    if (!userId) {
-      toast.error('You must be logged in.');
+    const token = getAccessToken();
+    if (!token) {
+      toast.error('You must be logged in to view your profile.');
+      navigate('/login');
       return;
     }
 
-    setSaving(true);
     try {
-      const updateData = {
-        first_name: formData.first_name,
-        last_name: formData.last_name,
-        bio: formData.bio,
-        location: formData.location,
-        updated_at: new Date().toISOString(),
-      };
+      const res = await fetch(`${API_URL}/api/profiles/me`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
+      });
 
-      const { error: updateError } = await supabaseClient
-        .from('profiles')
-        .update(updateData)
-        .eq('user_id', userId);
+      console.log('GET /api/profiles/me status:', res.status);
 
-      if (updateError) {
-        console.error('Update error:', updateError);
-        toast.error('Failed to update profile');
+      if (!res.ok) {
+        const text = await res.text();
+        console.error('Error response body:', text);
+        toast.error(`Failed to load profile (${res.status})`);
         return;
       }
 
-      toast.success('Profile updated successfully!');
-      await loadProfile(); // refresh the UI
-    } catch (error) {
-      console.error('Save error:', error);
-      toast.error('An unexpected error occurred');
+      const data = await res.json();
+      console.log('Loaded profile data:', data);
+
+      setProfile({
+        full_name: data.full_name || '',
+        sport: data.sport || '',
+        coaching_level: data.coaching_level || '',
+        location: data.location || '',
+        years_experience: data.years_experience ?? '',
+        bio: data.bio || '',
+        twitter_handle: data.twitter_handle || '',
+        instagram_handle: data.instagram_handle || '',
+      });
+    } catch (err) {
+      console.error('Network or parsing error fetching profile:', err);
+      toast.error('Network error loading profile.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveProfile(e?: React.FormEvent) {
+    if (e && e.preventDefault) e.preventDefault();
+
+    console.log('UserProfilePage: saving profile to API...', profile);
+    setSaving(true);
+
+    const token = getAccessToken();
+    if (!token) {
+      toast.error('You must be logged in to update your profile.');
+      navigate('/login');
+      setSaving(false);
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_URL}/api/profiles/me`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          full_name: profile.full_name,
+          sport: profile.sport,
+          coaching_level: profile.coaching_level,
+          location: profile.location,
+          years_experience:
+            typeof profile.years_experience === 'string'
+              ? Number(profile.years_experience) || 0
+              : profile.years_experience,
+          bio: profile.bio,
+          twitter_handle: profile.twitter_handle,
+          instagram_handle: profile.instagram_handle,
+        }),
+      });
+
+      console.log('PUT /api/profiles/me status:', res.status);
+
+      if (!res.ok) {
+        const text = await res.text();
+        console.error('Error response body on save:', text);
+        toast.error(`Failed to update profile (${res.status})`);
+        return;
+      }
+
+      const data = await res.json();
+      console.log('Updated profile returned:', data);
+
+      toast.success('Profile updated!');
+    } catch (err) {
+      console.error('Network or parsing error saving profile:', err);
+      toast.error('Network error saving profile.');
     } finally {
       setSaving(false);
     }
-  };
+  }
 
-  const handleLogout = async () => {
-    try {
-      await supabaseClient.auth.signOut();
-    } catch (err) {
-      console.error('Logout error:', err);
-    }
-    toast.success('Logged out successfully');
-    navigate('/');
-  };
+  // ================
+  // Effects
+  // ================
+  useEffect(() => {
+    fetchProfile();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
+  // ================
+  // Handlers
+  // ================
+  function handleChange(
+    field: keyof CoachProfile,
+    value: string | number
+  ) {
+    setProfile(prev => ({
+      ...prev,
+      [field]: value,
+    }));
+  }
+
+  // ================
+  // Render
+  // ================
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto" />
-          <p className="mt-4 text-gray-600">Loading profile...</p>
-        </div>
+      <div className="max-w-3xl mx-auto py-12 px-4">
+        <h1 className="text-2xl font-bold mb-4">Coach Profile</h1>
+        <p>Loading your profile...</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 py-12 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-2xl mx-auto">
-        <div className="bg-white rounded-lg shadow-lg p-8">
-          <div className="flex justify-between items-center mb-8">
-            <h2 className="text-3xl font-bold text-gray-900">My Profile</h2>
-            <button
-              onClick={handleLogout}
-              className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md transition"
-            >
-              Logout
-            </button>
-          </div>
+    <div className="max-w-3xl mx-auto py-12 px-4 space-y-6">
+      <h1 className="text-3xl font-bold mb-2">Coach Profile</h1>
+      <p className="text-gray-600 mb-6">
+        This is what other coaches see on Coach2Coach. Keep it up to date so they know who they&apos;re learning from.
+      </p>
 
-          <form onSubmit={handleSubmit} className="space-y-6">
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="first_name" className="block text-sm font-medium text-gray-700">
-                  First Name
-                </label>
-                <input
-                  id="first_name"
-                  name="first_name"
-                  type="text"
-                  required
-                  value={formData.first_name}
-                  onChange={handleInputChange}
-                  className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="last_name" className="block text-sm font-medium text-gray-700">
-                  Last Name
-                </label>
-                <input
-                  id="last_name"
-                  name="last_name"
-                  type="text"
-                  required
-                  value={formData.last_name}
-                  onChange={handleInputChange}
-                  className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label htmlFor="email" className="block text-sm font-medium text-gray-700">
-                Email (read-only)
-              </label>
-              <input
-                id="email"
-                name="email"
-                type="email"
-                value={formData.email}
-                readOnly
-                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm bg-gray-50 text-gray-500 cursor-not-allowed"
-              />
-            </div>
-
-            <div>
-              <label htmlFor="bio" className="block text-sm font-medium text-gray-700">
-                Bio
-              </label>
-              <textarea
-                id="bio"
-                name="bio"
-                rows="4"
-                maxLength="500"
-                value={formData.bio}
-                onChange={handleInputChange}
-                placeholder="Tell us about yourself"
-                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              />
-              <p className="mt-1 text-xs text-gray-500">{formData.bio.length}/500 characters</p>
-            </div>
-
-            <div>
-              <label htmlFor="location" className="block text-sm font-medium text-gray-700">
-                Location
-              </label>
-              <input
-                id="location"
-                name="location"
-                type="text"
-                value={formData.location}
-                onChange={handleInputChange}
-                placeholder="City, Country"
-                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={saving}
-              className={`w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white ${
-                saving
-                  ? 'bg-gray-400 cursor-not-allowed'
-                  : 'bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
-              }`}
-            >
-              {saving ? 'Saving...' : 'Update Profile'}
-            </button>
-          </form>
+      <form onSubmit={saveProfile} className="space-y-5">
+        {/* Full Name */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Full Name</label>
+          <input
+            type="text"
+            className="w-full border rounded-lg px-3 py-2"
+            value={profile.full_name}
+            onChange={(e) => handleChange('full_name', e.target.value)}
+          />
         </div>
-      </div>
+
+        {/* Sport */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Sport</label>
+          <input
+            type="text"
+            className="w-full border rounded-lg px-3 py-2"
+            placeholder="Baseball, Football, Soccer..."
+            value={profile.sport}
+            onChange={(e) => handleChange('sport', e.target.value)}
+          />
+        </div>
+
+        {/* Coaching Level */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Coaching Level</label>
+          <input
+            type="text"
+            className="w-full border rounded-lg px-3 py-2"
+            placeholder="Youth, High School, College..."
+            value={profile.coaching_level}
+            onChange={(e) => handleChange('coaching_level', e.target.value)}
+          />
+        </div>
+
+        {/* Location */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Location</label>
+          <input
+            type="text"
+            className="w-full border rounded-lg px-3 py-2"
+            placeholder="City, State, Country"
+            value={profile.location}
+            onChange={(e) => handleChange('location', e.target.value)}
+          />
+        </div>
+
+        {/* Years Experience */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Years of Coaching Experience</label>
+          <input
+            type="number"
+            min={0}
+            className="w-full border rounded-lg px-3 py-2"
+            value={profile.years_experience}
+            onChange={(e) => handleChange('years_experience', e.target.value)}
+          />
+        </div>
+
+        {/* Bio */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Coaching Bio</label>
+          <textarea
+            className="w-full border rounded-lg px-3 py-2 min-h-[100px]"
+            placeholder="Your coaching philosophy, key accomplishments, teams you’ve worked with..."
+            value={profile.bio}
+            onChange={(e) => handleChange('bio', e.target.value)}
+          />
+        </div>
+
+        {/* Socials */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Twitter / X Handle</label>
+            <input
+              type="text"
+              className="w-full border rounded-lg px-3 py-2"
+              placeholder="@CoachZ"
+              value={profile.twitter_handle}
+              onChange={(e) => handleChange('twitter_handle', e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Instagram Handle</label>
+            <input
+              type="text"
+              className="w-full border rounded-lg px-3 py-2"
+              placeholder="@CoachZBaseball"
+              value={profile.instagram_handle}
+              onChange={(e) => handleChange('instagram_handle', e.target.value)}
+            />
+          </div>
+        </div>
+
+        <button
+          type="submit"
+          disabled={saving}
+          className="mt-4 inline-flex items-center px-4 py-2 rounded-lg border border-transparent bg-black text-white font-semibold hover:opacity-90 disabled:opacity-60"
+        >
+          {saving ? 'Saving...' : 'Update Profile'}
+        </button>
+      </form>
     </div>
   );
 }
