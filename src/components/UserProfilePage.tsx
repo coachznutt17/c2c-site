@@ -36,24 +36,42 @@ export default function UserProfilePage() {
     instagram_handle: '',
   });
 
-  function getAccessToken(): string | null {
-    try {
-      const raw = localStorage.getItem(SUPABASE_AUTH_KEY);
-      if (!raw) {
-        console.warn('No Supabase auth token in localStorage');
-        return null;
+ function getAccessToken(): string | null {
+  try {
+    // Try several possible keys where a token might be stored
+    const possibleKeys = [
+      'sb-xkjidqfsenjrcabsagoi-auth-token', // Supabase default
+      'c2c_token',                          // your earlier custom token key
+    ];
+
+    for (const key of possibleKeys) {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+
+      let token: string | null = null;
+
+      // Try to parse JSON (Supabase-style), otherwise treat as plain string
+      try {
+        const parsed = JSON.parse(raw);
+        token = parsed?.access_token || parsed?.token || null;
+      } catch {
+        token = raw;
       }
-      const parsed = JSON.parse(raw);
-      const token = parsed?.access_token;
-      if (!token) {
-        console.warn('Parsed Supabase auth token has no access_token field', parsed);
+
+      if (token) {
+        console.log('Using auth token from localStorage key:', key);
+        return token;
       }
-      return token || null;
-    } catch (err) {
-      console.error('Error reading Supabase auth token from localStorage:', err);
-      return null;
     }
+
+    console.warn('No auth token found in known localStorage keys:', Object.keys(localStorage));
+    return null;
+  } catch (err) {
+    console.error('Error reading auth token from localStorage:', err);
+    return null;
   }
+}
+
 
   async function fetchProfile() {
     console.log('UserProfilePage: fetching profile from API...');
